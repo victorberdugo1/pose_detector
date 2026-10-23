@@ -1,0 +1,3 @@
+#ifndef LITERT_BUILD_CONFIG_SHIM_H_
+#define LITERT_BUILD_CONFIG_SHIM_H_
+#endif

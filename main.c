@@ -1,0 +1,1339 @@
+
+#include "raylib.h"
+#include "raymath.h"
+#include "pose.h"
+#include "pose_model.h"
+#include <ctype.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define WIN_W 1280
+#define WIN_H 800
+
+#define BOARD_HEIGHT 3.5f
+#define MAX_BOARD_WIDTH 5.5f
+#define LIGHT_RADIUS 3.8f
+#define LIGHT_DEPTH 2.0f
+#define DRAG_LIGHT_DISTANCE 2.0f
+#define GIF_FPS 10.0f
+#define POSE_PICK_RADIUS 12.0f
+#define SCENE_TOP 112.0f
+#define SCENE_BOTTOM 94.0f
+#define SIDE_PANEL_RATIO 0.3f
+
+#define TEXT_TITLE 28.0f
+#define TEXT_HEADING 18.0f
+#define TEXT_BODY 16.0f
+#define TEXT_SMALL 14.0f
+#define UI_SCALE_MIN 0.75f
+#define UI_SCALE_MAX 4.0f
+#define UI_FONT_BASE_SIZE 64
+#define UI_TEXT_SPACING 0.05f
+
+static Font uiFont = { 0 };
+static float uiScale = 1.0f;
+
+static Texture2D originalTexture = { 0 };
+static Texture2D normalTexture = { 0 };
+static Shader lightShader = { 0 };
+
+static Image sprite = { 0 };
+static unsigned char *normalFrames = NULL;
+static float *depthMaps = NULL;
+static float depthSpan = 0.0f;
+static unsigned char *depthPixels = NULL;
+static Texture2D depthTexture = { 0 };
+static Pose *poses = NULL;
+static PoseLimbs limbs = { 0 };
+static int frameCount = 0;
+static int frameIndex = 0;
+static float frameClock = 0.0f;
+static int dragJoint = -1;
+static bool dragSide = false;
+static bool scrubbing = false;
+static char spritePath[512] = "";
+
+static bool hasImage = false;
+static bool showNormals = false;
+static bool autoLight = true;
+static bool playing = true;
+static bool poseMode = false;
+static bool showDepth = false;
+
+static float lightStrength = 2.0f;
+static float lightSpeed = 1.0f;
+static float lightAngle = 0.0f;
+static float verticalLightAngle = 0.0f;
+
+static float cameraYaw = 0.65f;
+static float cameraPitch = 0.32f;
+static float cameraDistance = 11.5f;
+
+static Vector2 imageSize = { 1.0f, 1.0f };
+static Vector2 billboardSize = { 3.5f, 3.5f };
+
+static const Vector3 BOARD_CENTER = { 0.0f, 2.0f, 0.0f };
+
+static char statusText[256] =
+    "Arrastra una imagen o GIF a la ventana o pega su ruta con Ctrl+V";
+
+static PoseModel poseModel = { 0 };
+static bool poseModelReady = false;
+
+static const char *fragmentShader =
+    "#version 330\n"
+    "in vec2 fragTexCoord;\n"
+    "in vec4 fragColor;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform sampler2D normalMap;\n"
+    "uniform vec3 lightLocal1;\n"
+    "uniform vec3 lightLocal2;\n"
+    "uniform vec3 lightColor1;\n"
+    "uniform vec3 lightColor2;\n"
+    "uniform vec2 boardSize;\n"
+    "uniform float strength;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 albedo = texture(texture0, fragTexCoord);\n"
+    "    if (albedo.a < 0.01) discard;\n"
+    "    vec3 n = texture(normalMap, fragTexCoord).rgb * 2.0 - 1.0;\n"
+    "    n = normalize(n);\n"
+    "    vec3 surface = vec3(\n"
+    "        (fragTexCoord.x - 0.5) * boardSize.x,\n"
+    "        (0.5 - fragTexCoord.y) * boardSize.y,\n"
+    "        0.0\n"
+    "    );\n"
+    "    vec3 delta1 = lightLocal1 - surface;\n"
+    "    vec3 delta2 = lightLocal2 - surface;\n"
+    "    float dist1 = max(dot(delta1, delta1), 0.001);\n"
+    "    float dist2 = max(dot(delta2, delta2), 0.001);\n"
+    "    vec3 L1 = normalize(delta1);\n"
+    "    vec3 L2 = normalize(delta2);\n"
+    "    float diffuse1 = max(dot(n, L1), 0.0);\n"
+    "    float diffuse2 = max(dot(n, L2), 0.0);\n"
+    "    float atten1 = 1.0 / (1.0 + 0.08 * dist1);\n"
+    "    float atten2 = 1.0 / (1.0 + 0.08 * dist2);\n"
+    "    vec3 lighting = vec3(0.18);\n"
+    "    lighting += strength * diffuse1 * atten1 * lightColor1;\n"
+    "    lighting += strength * diffuse2 * atten2 * lightColor2;\n"
+    "    lighting = clamp(lighting, vec3(0.0), vec3(1.8));\n"
+    "    finalColor = vec4(albedo.rgb * lighting, albedo.a) * fragColor;\n"
+    "}\n";
+
+static float Ui(float value)
+{
+    return value * uiScale;
+}
+
+static void UpdateUiScale(void)
+{
+    float scale = fminf(
+        (float)GetScreenWidth() / WIN_W,
+        (float)GetScreenHeight() / WIN_H
+    );
+
+    uiScale = Clamp(scale, UI_SCALE_MIN, UI_SCALE_MAX);
+}
+
+static bool UiFontIsCustom(void)
+{
+    return uiFont.texture.id != GetFontDefault().texture.id;
+}
+
+static void LoadUiFont(void)
+{
+    static const char *const candidates[] = {
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arial.ttf"
+    };
+
+    uiFont = GetFontDefault();
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
+    {
+        if (!FileExists(candidates[i]))
+            continue;
+
+        Font font = LoadFontEx(candidates[i], UI_FONT_BASE_SIZE, NULL, 0);
+
+        if (font.texture.id == GetFontDefault().texture.id)
+            continue;
+
+        GenTextureMipmaps(&font.texture);
+        SetTextureFilter(font.texture, TEXTURE_FILTER_TRILINEAR);
+        uiFont = font;
+        return;
+    }
+}
+
+static float MeasureUiText(const char *text, float size)
+{
+    float fontSize = Ui(size);
+
+    return MeasureTextEx(uiFont, text, fontSize, fontSize * UI_TEXT_SPACING).x;
+}
+
+static void DrawUiText(const char *text, float x, float y, float size, Color color)
+{
+    float fontSize = Ui(size);
+
+    DrawTextEx(
+        uiFont, text, (Vector2){ floorf(x), floorf(y) },
+        fontSize, fontSize * UI_TEXT_SPACING, color
+    );
+}
+
+static void DrawUiTextRight(const char *text, float right, float y, float size, Color color)
+{
+    DrawUiText(text, right - MeasureUiText(text, size), y, size, color);
+}
+
+static float GetHeight(Color c)
+{
+    return (0.299f * c.r +
+            0.587f * c.g +
+            0.114f * c.b) / 255.0f;
+}
+
+static Image GenerateNormalMap(Image src)
+{
+    int w = src.width;
+    int h = src.height;
+
+    Image result = GenImageColor(
+        w, h, (Color){ 128, 128, 255, 255 }
+    );
+
+    for (int y = 0; y < h; y++)
+    {
+        for (int x = 0; x < w; x++)
+        {
+            int xl = (x > 0) ? x - 1 : x;
+            int xr = (x < w - 1) ? x + 1 : x;
+            int yu = (y > 0) ? y - 1 : y;
+            int yd = (y < h - 1) ? y + 1 : y;
+
+            float left = GetHeight(GetImageColor(src, xl, y));
+            float right = GetHeight(GetImageColor(src, xr, y));
+            float up = GetHeight(GetImageColor(src, x, yu));
+            float down = GetHeight(GetImageColor(src, x, yd));
+
+            float nx = (left - right) * 4.0f;
+            float ny = (down - up) * 4.0f;
+            float nz = 1.0f;
+
+            float len = sqrtf(nx * nx + ny * ny + nz * nz);
+
+            nx /= len;
+            ny /= len;
+            nz /= len;
+
+            Color c = {
+                (unsigned char)((nx * 0.5f + 0.5f) * 255.0f),
+                (unsigned char)((ny * 0.5f + 0.5f) * 255.0f),
+                (unsigned char)((nz * 0.5f + 0.5f) * 255.0f),
+                255
+            };
+
+            ImageDrawPixel(&result, x, y, c);
+        }
+    }
+
+    return result;
+}
+
+static Image FrameView(void *base, int w, int h, int index)
+{
+    return (Image){
+        (unsigned char *)base + (size_t)w * h * 4 * index,
+        w, h, 1,
+        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+    };
+}
+
+static void UpdateDepthTexture(int index)
+{
+    PoseDepthImage(
+        depthMaps + PoseDepthCells(sprite.width, sprite.height) * index,
+        FrameView(sprite.data, sprite.width, sprite.height, index).data,
+        sprite.width, sprite.height, depthPixels
+    );
+
+    UpdateTexture(depthTexture, depthPixels);
+}
+
+static void ShowFrame(int index)
+{
+    frameIndex = index;
+
+    UpdateTexture(
+        originalTexture,
+        FrameView(sprite.data, sprite.width, sprite.height, index).data
+    );
+
+    UpdateTexture(
+        normalTexture,
+        FrameView(normalFrames, sprite.width, sprite.height, index).data
+    );
+
+    UpdateDepthTexture(index);
+}
+
+static Rectangle TimelineRect(void)
+{
+    return (Rectangle){ Ui(24.0f), Ui(98.0f), (float)GetScreenWidth() - Ui(48.0f), Ui(10.0f) };
+}
+
+static void StepFrame(int direction)
+{
+    playing = false;
+    ShowFrame((frameIndex + direction + frameCount) % frameCount);
+}
+
+static void UpdateTimeline(void)
+{
+    Rectangle bar = TimelineRect();
+    Vector2 mouse = GetMousePosition();
+    Rectangle hit = { bar.x, bar.y - Ui(6.0f), bar.width, bar.height + Ui(12.0f) };
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, hit))
+        scrubbing = true;
+
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+        scrubbing = false;
+
+    if (!scrubbing)
+        return;
+
+    int index = (int)((mouse.x - bar.x) / bar.width * frameCount);
+    index = index < 0 ? 0 : (index >= frameCount ? frameCount - 1 : index);
+
+    if (index != frameIndex)
+    {
+        playing = false;
+        ShowFrame(index);
+    }
+}
+
+static void DrawTimeline(void)
+{
+    Rectangle bar = TimelineRect();
+    float cell = bar.width / frameCount;
+
+    for (int i = 0; i < frameCount; i++)
+        DrawRectangleRec(
+            (Rectangle){ bar.x + i * cell + Ui(1.0f), bar.y, cell - Ui(2.0f), bar.height },
+            i == frameIndex ? GOLD : (Color){ 60, 70, 90, 255 }
+        );
+}
+
+static void RefreshPoseDepth(int index)
+{
+    PoseApplyDepth(
+        &poses[index],
+        depthMaps + PoseDepthCells(sprite.width, sprite.height) * index,
+        sprite.width, sprite.height, depthSpan
+    );
+}
+
+static void UnloadSprite(void)
+{
+    UnloadTexture(originalTexture);
+    UnloadTexture(normalTexture);
+    UnloadTexture(depthTexture);
+    UnloadImage(sprite);
+    free(normalFrames);
+    free(depthPixels);
+    free(depthMaps);
+    free(poses);
+    sprite = (Image){ 0 };
+    normalFrames = NULL;
+    depthMaps = NULL;
+    depthPixels = NULL;
+    poses = NULL;
+    hasImage = false;
+}
+
+static void DetectPose(const uint8_t *rgba, int w, int h, Pose *pose)
+{
+    if (!poseModelReady || !PoseModelDetect(&poseModel, rgba, w, h, pose))
+        PoseDetect(rgba, w, h, pose);
+}
+
+static bool LoadDroppedImage(const char *path)
+{
+    if (!IsFileExtension(
+            path, ".png;.jpg;.jpeg;.bmp;.gif;.tga"))
+    {
+        snprintf(statusText, sizeof(statusText),
+                 "Formato no compatible: %s", GetFileName(path));
+        return false;
+    }
+
+    int frames = 0;
+    Image anim = LoadImageAnim(path, &frames);
+
+    if (anim.data == NULL || anim.width <= 0 || anim.height <= 0 || frames <= 0)
+    {
+        UnloadImage(anim);
+        snprintf(statusText, sizeof(statusText),
+                 "No se pudo abrir: %s", GetFileName(path));
+        return false;
+    }
+
+    if (anim.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+        ImageFormat(&anim, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+
+    size_t bytes = (size_t)anim.width * anim.height * 4;
+    unsigned char *newNormals = malloc(bytes * frames);
+    Pose *newPoses = calloc(frames, sizeof(Pose));
+    size_t depthCells = PoseDepthCells(anim.width, anim.height);
+    float *newDepth = malloc(depthCells * frames * sizeof(float));
+    unsigned char *newDepthPixels = malloc(depthCells * 4);
+    float newSpan = 0.0f;
+
+    if (newNormals == NULL || newPoses == NULL || newDepth == NULL || newDepthPixels == NULL)
+    {
+        free(newNormals);
+        free(newDepth);
+        free(newDepthPixels);
+        free(newPoses);
+        UnloadImage(anim);
+        snprintf(statusText, sizeof(statusText), "Memoria insuficiente");
+        return false;
+    }
+
+    for (int i = 0; i < frames; i++)
+    {
+        Image view = FrameView(anim.data, anim.width, anim.height, i);
+
+        PoseKeyBackground(view.data, anim.width, anim.height);
+
+        Image normals = GenerateNormalMap(view);
+
+        memcpy(newNormals + bytes * i, normals.data, bytes);
+        UnloadImage(normals);
+        newSpan = fmaxf(newSpan, PoseIntegrateDepth(
+            newNormals + bytes * i, view.data,
+            anim.width, anim.height, newDepth + depthCells * i
+        ));
+        DetectPose(view.data, anim.width, anim.height, &newPoses[i]);
+    }
+
+    PoseLimbs newLimbs = PoseMeasureLimbs(newPoses, frames);
+
+    for (int i = 0; i < frames; i++)
+    {
+        PoseFitLimbs(&newPoses[i], &newLimbs);
+        PoseApplyDepth(
+            &newPoses[i], newDepth + depthCells * i,
+            anim.width, anim.height, newSpan
+        );
+    }
+
+    PoseDepthImage(newDepth, anim.data, anim.width, anim.height, newDepthPixels);
+
+    Texture2D newDepthTexture = LoadTextureFromImage((Image){
+        newDepthPixels,
+        PoseDepthSize(anim.width), PoseDepthSize(anim.height), 1,
+        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+    });
+    Texture2D newOriginal = LoadTextureFromImage(
+        FrameView(anim.data, anim.width, anim.height, 0)
+    );
+    Texture2D newNormalTexture = LoadTextureFromImage(
+        FrameView(newNormals, anim.width, anim.height, 0)
+    );
+
+    if (newOriginal.id == 0 || newNormalTexture.id == 0 || newDepthTexture.id == 0)
+    {
+        if (newDepthTexture.id != 0)
+            UnloadTexture(newDepthTexture);
+
+        if (newOriginal.id != 0)
+            UnloadTexture(newOriginal);
+
+        if (newNormalTexture.id != 0)
+            UnloadTexture(newNormalTexture);
+
+        free(newNormals);
+        free(newDepth);
+        free(newDepthPixels);
+        free(newPoses);
+        UnloadImage(anim);
+
+        snprintf(statusText, sizeof(statusText),
+                 "No se pudieron crear las texturas");
+        return false;
+    }
+
+    SetTextureFilter(newOriginal, TEXTURE_FILTER_BILINEAR);
+    SetTextureFilter(newNormalTexture, TEXTURE_FILTER_BILINEAR);
+    SetTextureFilter(newDepthTexture, TEXTURE_FILTER_BILINEAR);
+
+    if (hasImage)
+        UnloadSprite();
+
+    sprite = anim;
+    normalFrames = newNormals;
+    depthMaps = newDepth;
+    depthSpan = newSpan;
+    depthPixels = newDepthPixels;
+    depthTexture = newDepthTexture;
+    poses = newPoses;
+    limbs = newLimbs;
+    frameCount = frames;
+    frameIndex = 0;
+    frameClock = 0.0f;
+    dragJoint = -1;
+    playing = frames > 1;
+    originalTexture = newOriginal;
+    normalTexture = newNormalTexture;
+    snprintf(spritePath, sizeof(spritePath), "%s", path);
+
+    imageSize = (Vector2){
+        (float)originalTexture.width,
+        (float)originalTexture.height
+    };
+
+    float aspect = imageSize.x / imageSize.y;
+
+    billboardSize.y = BOARD_HEIGHT;
+    billboardSize.x = BOARD_HEIGHT * aspect;
+
+    if (billboardSize.x > MAX_BOARD_WIDTH)
+    {
+        billboardSize.x = MAX_BOARD_WIDTH;
+        billboardSize.y = MAX_BOARD_WIDTH / aspect;
+    }
+
+    hasImage = true;
+    showNormals = false;
+
+    snprintf(statusText, sizeof(statusText),
+             "%s | %d x %d | %d frames",
+             GetFileName(path),
+             originalTexture.width,
+             originalTexture.height,
+             frameCount);
+
+    return true;
+}
+
+static void UpdateOrbitCamera(Camera3D *camera)
+{
+    Vector3 target = BOARD_CENTER;
+    float cp = cosf(cameraPitch);
+
+    camera->target = target;
+    camera->position = (Vector3){
+        target.x + sinf(cameraYaw) * cp * cameraDistance,
+        target.y + sinf(cameraPitch) * cameraDistance,
+        target.z + cosf(cameraYaw) * cp * cameraDistance
+    };
+
+    camera->up = (Vector3){ 0.0f, 1.0f, 0.0f };
+}
+
+static void GetCameraAxes(
+    Camera3D camera,
+    Vector3 *right,
+    Vector3 *up,
+    Vector3 *normal)
+{
+    Vector3 forward = Vector3Normalize(
+        Vector3Subtract(camera.target, camera.position)
+    );
+
+    *right = Vector3Normalize(
+        Vector3CrossProduct(forward, camera.up)
+    );
+
+    *up = Vector3Normalize(
+        Vector3CrossProduct(*right, forward)
+    );
+
+    *normal = Vector3Scale(forward, -1.0f);
+}
+
+static Vector3 WorldLightToBillboard(
+    Camera3D camera,
+    Vector3 lightPosition)
+{
+    Vector3 right, up, normal;
+
+    GetCameraAxes(camera, &right, &up, &normal);
+
+    Vector3 delta = Vector3Subtract(lightPosition, BOARD_CENTER);
+
+    return (Vector3){
+        Vector3DotProduct(delta, right),
+        Vector3DotProduct(delta, up),
+        Vector3DotProduct(delta, normal)
+    };
+}
+
+static Vector3 GetFirstLightPosition(
+    Camera3D camera,
+    float angle)
+{
+    Vector3 right, up, normal;
+
+    GetCameraAxes(camera, &right, &up, &normal);
+
+    float radius = fmaxf(
+        LIGHT_RADIUS,
+        billboardSize.x * 0.5f + 1.0f
+    );
+
+    Vector3 p = BOARD_CENTER;
+
+    p = Vector3Add(
+        p, Vector3Scale(right, cosf(angle) * radius)
+    );
+
+    p = Vector3Add(
+        p, Vector3Scale(up, sinf(angle) * radius * 0.65f)
+    );
+
+    p = Vector3Add(
+        p, Vector3Scale(normal,
+            LIGHT_DEPTH + 0.4f * sinf(angle * 0.5f))
+    );
+
+    return p;
+}
+
+static Vector3 GetSecondLightPosition(
+    Camera3D camera,
+    float angle)
+{
+    Vector3 right, up, normal;
+
+    GetCameraAxes(camera, &right, &up, &normal);
+
+    float rightDistance = billboardSize.x * 0.5f + 1.2f;
+    float verticalOffset = cosf(angle) * 2.6f;
+
+    Vector3 p = BOARD_CENTER;
+
+    p = Vector3Add(
+        p, Vector3Scale(right, rightDistance)
+    );
+
+    p = Vector3Add(
+        p, Vector3Scale(up, verticalOffset)
+    );
+
+    p = Vector3Add(
+        p, Vector3Scale(normal, LIGHT_DEPTH)
+    );
+
+    return p;
+}
+
+static bool GetDraggedLightPosition(
+    Camera3D camera,
+    Vector2 mouse,
+    Vector3 *result)
+{
+    Ray ray = GetScreenToWorldRay(mouse, camera);
+
+    Vector3 right, up, normal;
+    GetCameraAxes(camera, &right, &up, &normal);
+
+    Vector3 toPlane = Vector3Subtract(
+        BOARD_CENTER, ray.position
+    );
+
+    float denominator = Vector3DotProduct(
+        ray.direction, normal
+    );
+
+    if (fabsf(denominator) < 0.0001f)
+        return false;
+
+    float t = Vector3DotProduct(toPlane, normal) / denominator;
+
+    if (t < 0.0f)
+        return false;
+
+    Vector3 hit = Vector3Add(
+        ray.position, Vector3Scale(ray.direction, t)
+    );
+
+    *result = Vector3Add(
+        hit, Vector3Scale(normal, DRAG_LIGHT_DISTANCE)
+    );
+
+    return true;
+}
+
+static void DrawScene3D(
+    Camera3D camera,
+    Vector3 light1,
+    Vector3 light2,
+    int locNormalMap)
+{
+    BeginMode3D(camera);
+
+    DrawPlane(
+        (Vector3){ 0.0f, -0.03f, 0.0f },
+        (Vector2){ 40.0f, 40.0f },
+        (Color){ 37, 43, 51, 255 }
+    );
+
+    DrawGrid(40, 1.0f);
+
+    DrawCylinder(
+        (Vector3){ 0.0f, 0.12f, 0.0f },
+        1.15f, 1.35f, 0.24f, 32,
+        (Color){ 55, 63, 76, 255 }
+    );
+
+    DrawCylinderWires(
+        (Vector3){ 0.0f, 0.12f, 0.0f },
+        1.15f, 1.35f, 0.24f, 32,
+        (Color){ 105, 123, 145, 255 }
+    );
+
+    DrawSphere(
+        light1, 0.16f,
+        (Color){ 255, 218, 145, 255 }
+    );
+
+    DrawSphere(
+        light2, 0.16f,
+        (Color){ 150, 195, 255, 255 }
+    );
+
+    if (hasImage)
+    {
+        Rectangle source = {
+            0.0f, 0.0f,
+            (float)originalTexture.width,
+            (float)originalTexture.height
+        };
+
+        if (showNormals)
+        {
+            DrawBillboardRec(
+                camera, normalTexture, source,
+                BOARD_CENTER, billboardSize, WHITE
+            );
+        }
+        else
+        {
+            SetShaderValueTexture(
+                lightShader, locNormalMap, normalTexture
+            );
+
+            BeginShaderMode(lightShader);
+
+            DrawBillboardRec(
+                camera, originalTexture, source,
+                BOARD_CENTER, billboardSize, WHITE
+            );
+
+            EndShaderMode();
+        }
+    }
+    else
+    {
+        DrawCube(
+            BOARD_CENTER,
+            2.4f, BOARD_HEIGHT, 0.12f,
+            (Color){ 38, 85, 115, 255 }
+        );
+
+        DrawCubeWires(
+            BOARD_CENTER,
+            2.4f, BOARD_HEIGHT, 0.12f,
+            SKYBLUE
+        );
+    }
+
+    EndMode3D();
+}
+
+static Rectangle PoseViewRect(void)
+{
+    float areaW = (float)GetScreenWidth() * (1.0f - SIDE_PANEL_RATIO) - Ui(50.0f);
+    float areaH = (float)GetScreenHeight() - Ui(SCENE_TOP) - Ui(SCENE_BOTTOM) - Ui(20.0f);
+    float scale = fminf(areaW / sprite.width, areaH / sprite.height);
+    float w = sprite.width * scale;
+    float h = sprite.height * scale;
+
+    return (Rectangle){
+        Ui(20.0f) + (areaW - w) * 0.5f,
+        Ui(SCENE_TOP) + Ui(10.0f) + (areaH - h) * 0.5f,
+        w, h
+    };
+}
+
+static Rectangle SidePanelRect(void)
+{
+    Rectangle view = PoseViewRect();
+    float w = (float)GetScreenWidth() * SIDE_PANEL_RATIO;
+
+    return (Rectangle){ (float)GetScreenWidth() - Ui(20.0f) - w, view.y, w, view.height };
+}
+
+static float SideHalfWidth(Rectangle side)
+{
+    return side.width * 0.5f - Ui(10.0f);
+}
+
+static Vector2 PoseToScreen(Rectangle view, PosePoint p)
+{
+    float scale = view.width / sprite.width;
+
+    return (Vector2){ view.x + p.x * scale, view.y + p.y * scale };
+}
+
+static float SideZRange(Rectangle side, Rectangle view)
+{
+    return SideHalfWidth(side) / view.height;
+}
+
+static Vector2 PoseToSide(Rectangle side, Rectangle view, PosePoint p)
+{
+    float range = SideZRange(side, view);
+    float z = Clamp(p.z - 0.5f, -range, range);
+
+    return (Vector2){
+        side.x + side.width * 0.5f - z * view.height,
+        PoseToScreen(view, p).y
+    };
+}
+
+static void ExportPoses(void)
+{
+    const char *out = TextFormat(
+        "%s/%s.json",
+        GetDirectoryPath(spritePath),
+        GetFileNameWithoutExt(spritePath)
+    );
+
+    snprintf(statusText, sizeof(statusText),
+             PoseWriteJson(out, poses, frameCount, sprite.width, sprite.height)
+                 ? "Exportado: %s" : "No se pudo escribir: %s",
+             GetFileName(out));
+}
+
+static void UpdatePoseEditor(void)
+{
+    Rectangle view = PoseViewRect();
+    Vector2 mouse = GetMousePosition();
+    Pose *pose = &poses[frameIndex];
+
+    if (IsKeyPressed(KEY_R))
+    {
+        DetectPose(
+            FrameView(sprite.data, sprite.width, sprite.height, frameIndex).data,
+            sprite.width, sprite.height, pose
+        );
+        PoseFitLimbs(pose, &limbs);
+        RefreshPoseDepth(frameIndex);
+    }
+
+    if (IsKeyPressed(KEY_J))
+        ExportPoses();
+
+    if (IsKeyPressed(KEY_Z))
+        showDepth = !showDepth;
+
+    Rectangle side = SidePanelRect();
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid)
+    {
+        float best = Ui(POSE_PICK_RADIUS);
+
+        dragJoint = -1;
+        playing = false;
+
+        for (int j = 0; j < POSE_JOINTS; j++)
+        {
+            float dMain = Vector2Distance(mouse, PoseToScreen(view, pose->p[j]));
+            float dSide = Vector2Distance(mouse, PoseToSide(side, view, pose->p[j]));
+
+            if (dMain < best)
+            {
+                best = dMain;
+                dragJoint = j;
+                dragSide = false;
+            }
+
+            if (dSide < best)
+            {
+                best = dSide;
+                dragJoint = j;
+                dragSide = true;
+            }
+        }
+    }
+
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+        dragJoint = -1;
+
+    if (dragJoint >= 0 && dragSide)
+    {
+        PosePoint *p = &pose->p[dragJoint];
+        float range = SideZRange(side, view);
+        float z = 0.5f - (mouse.x - side.x - side.width * 0.5f) / view.height;
+
+        z = Clamp(z, 0.5f - range, 0.5f + range);
+        p->dz += z - p->z;
+        p->z = z;
+    }
+    else if (dragJoint >= 0)
+    {
+        float scale = view.width / sprite.width;
+
+        pose->p[dragJoint].x = Clamp((mouse.x - view.x) / scale, 0.0f, sprite.width - 1.0f);
+        pose->p[dragJoint].y = Clamp((mouse.y - view.y) / scale, 0.0f, sprite.height - 1.0f);
+
+        RefreshPoseDepth(frameIndex);
+    }
+}
+
+static void DrawPoseView(void)
+{
+    Rectangle view = PoseViewRect();
+    Rectangle source = {
+        0.0f, 0.0f,
+        (float)originalTexture.width,
+        (float)originalTexture.height
+    };
+
+    DrawRectangleRec(view, (Color){ 30, 34, 46, 255 });
+    DrawTexturePro(
+        showDepth ? depthTexture : originalTexture,
+        showDepth ? (Rectangle){ 0.0f, 0.0f, (float)depthTexture.width, (float)depthTexture.height } : source,
+        view, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE
+    );
+
+    Rectangle side = SidePanelRect();
+    float sideCenter = side.x + side.width * 0.5f;
+
+    DrawRectangleRec(side, (Color){ 30, 34, 46, 255 });
+
+    for (int t = -2; t <= 2; t++)
+    {
+        float x = sideCenter + t * 0.5f * SideHalfWidth(side);
+
+        DrawLine((int)x, (int)side.y, (int)x, (int)(side.y + side.height),
+                 t == 0 ? (Color){ 90, 100, 125, 255 } : (Color){ 52, 58, 74, 255 });
+    }
+
+    DrawUiText("Vista lateral (z) | arrastrar para editar", side.x + Ui(10.0f), side.y + Ui(8.0f), TEXT_BODY, RAYWHITE);
+    DrawUiText("lejos", side.x + Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
+    DrawUiTextRight("cerca", side.x + side.width - Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
+
+    const Pose *pose = &poses[frameIndex];
+
+    if (!pose->valid)
+        return;
+
+    Vector2 sidePoint[POSE_JOINTS];
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+        sidePoint[j] = PoseToSide(side, view, pose->p[j]);
+
+    for (int i = 0; i < POSE_BONE_COUNT; i++)
+        DrawLineEx(sidePoint[PoseBones[i][0]], sidePoint[PoseBones[i][1]], Ui(3.0f), (Color){ 80, 255, 120, 255 });
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+    {
+        DrawCircleV(sidePoint[j], Ui(j == dragJoint && dragSide ? 9.0f : 7.0f), ColorFromHSV(j * 20.0f, 0.85f, 1.0f));
+        DrawCircleLinesV(sidePoint[j], Ui(7.0f), BLACK);
+    }
+
+    if (dragJoint >= 0)
+        DrawUiText(
+            TextFormat("%s z=%.3f", PoseNames[dragJoint], pose->p[dragJoint].z),
+            side.x + Ui(10.0f), side.y + side.height - Ui(28.0f), TEXT_BODY, RAYWHITE
+        );
+
+    for (int i = 0; i < POSE_BONE_COUNT; i++)
+        DrawLineEx(
+            PoseToScreen(view, pose->p[PoseBones[i][0]]),
+            PoseToScreen(view, pose->p[PoseBones[i][1]]),
+            Ui(2.0f), (Color){ 80, 255, 120, 255 }
+        );
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+    {
+        Vector2 p = PoseToScreen(view, pose->p[j]);
+
+        DrawCircleV(p, Ui(j == dragJoint ? 7.0f : 5.0f), ColorFromHSV(j * 20.0f, 0.85f, 1.0f));
+        DrawCircleLinesV(p, Ui(5.0f), BLACK);
+    }
+}
+
+static bool LoadImageFromPathText(const char *text)
+{
+    char path[1024];
+
+    if (text == NULL)
+        return false;
+
+    while (*text != '\0' && (isspace((unsigned char)*text) || *text == '"' || *text == '\''))
+        text++;
+
+    size_t offset = 0;
+
+#ifndef _WIN32
+    if (isalpha((unsigned char)text[0]) && text[1] == ':' && (text[2] == '\\' || text[2] == '/'))
+    {
+        offset = snprintf(path, sizeof(path), "/mnt/%c", tolower((unsigned char)text[0]));
+        text += 2;
+    }
+#endif
+
+    size_t length = offset + (size_t)snprintf(path + offset, sizeof(path) - offset, "%s", text);
+
+    if (length >= sizeof(path))
+        length = sizeof(path) - 1;
+
+    while (length > 0 && (isspace((unsigned char)path[length - 1]) || path[length - 1] == '"' || path[length - 1] == '\''))
+        length--;
+
+    path[length] = '\0';
+
+#ifndef _WIN32
+    for (size_t i = 0; i < length; i++)
+        if (path[i] == '\\')
+            path[i] = '/';
+#endif
+
+    if (length == 0)
+        return false;
+
+    return LoadDroppedImage(path);
+}
+
+int main(int argc, char **argv)
+{
+    SetConfigFlags(
+        FLAG_WINDOW_RESIZABLE |
+        FLAG_VSYNC_HINT |
+        FLAG_MSAA_4X_HINT
+    );
+
+    InitWindow(WIN_W, WIN_H, "Normals 3D - Dual Lights");
+    MaximizeWindow();
+    SetTargetFPS(60);
+    LoadUiFont();
+
+    Camera3D camera = { 0 };
+    camera.fovy = 45.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    UpdateOrbitCamera(&camera);
+
+    lightShader = LoadShaderFromMemory(NULL, fragmentShader);
+
+    if (!IsShaderValid(lightShader))
+    {
+        if (UiFontIsCustom())
+            UnloadFont(uiFont);
+
+        CloseWindow();
+        return 1;
+    }
+
+    poseModelReady = PoseModelOpen(
+        &poseModel,
+        TextFormat("%s" POSE_MODEL_TASK, GetApplicationDirectory())
+    );
+
+    if (!poseModelReady)
+        snprintf(statusText, sizeof(statusText), "Modelo de pose no encontrado: usando heuristica");
+
+    int locLight1 = GetShaderLocation(lightShader, "lightLocal1");
+    int locLight2 = GetShaderLocation(lightShader, "lightLocal2");
+    int locColor1 = GetShaderLocation(lightShader, "lightColor1");
+    int locColor2 = GetShaderLocation(lightShader, "lightColor2");
+    int locBoardSize = GetShaderLocation(lightShader, "boardSize");
+    int locStrength = GetShaderLocation(lightShader, "strength");
+    int locNormalMap = GetShaderLocation(lightShader, "normalMap");
+
+    float lightColor1[3] = { 1.0f, 0.82f, 0.55f };
+    float lightColor2[3] = { 0.55f, 0.75f, 1.0f };
+
+    if (argc > 1)
+        LoadImageFromPathText(argv[1]);
+
+    while (!WindowShouldClose())
+    {
+        float dt = GetFrameTime();
+
+        UpdateUiScale();
+
+        if (IsFileDropped())
+        {
+            FilePathList files = LoadDroppedFiles();
+
+            if (files.count > 0)
+                LoadDroppedImage(files.paths[0]);
+
+            UnloadDroppedFiles(files);
+        }
+
+        if (IsKeyPressed(KEY_V) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
+            LoadImageFromPathText(GetClipboardText());
+
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+        {
+            Vector2 delta = GetMouseDelta();
+
+            cameraYaw += delta.x * 0.005f;
+            cameraPitch += delta.y * 0.005f;
+
+            if (cameraPitch > 1.35f) cameraPitch = 1.35f;
+            if (cameraPitch < -1.35f) cameraPitch = -1.35f;
+        }
+
+        cameraDistance -= GetMouseWheelMove() * 0.8f;
+
+        if (cameraDistance < 4.5f) cameraDistance = 4.5f;
+        if (cameraDistance > 24.0f) cameraDistance = 24.0f;
+
+        UpdateOrbitCamera(&camera);
+
+        if (IsKeyPressed(KEY_SPACE) && hasImage)
+            showNormals = !showNormals;
+
+        if (IsKeyPressed(KEY_P) && hasImage)
+        {
+            poseMode = !poseMode;
+            dragJoint = -1;
+        }
+
+        if (IsKeyPressed(KEY_G) && frameCount > 1)
+            playing = !playing;
+
+        if (hasImage && frameCount > 1)
+        {
+            if (IsKeyPressed(KEY_COMMA) || IsKeyPressed(KEY_A) ||
+                (poseMode && IsKeyPressed(KEY_LEFT)))
+                StepFrame(-1);
+
+            if (IsKeyPressed(KEY_PERIOD) || IsKeyPressed(KEY_D) ||
+                (poseMode && IsKeyPressed(KEY_RIGHT)))
+                StepFrame(1);
+
+            UpdateTimeline();
+
+            if (playing)
+            {
+                frameClock += dt;
+
+                if (frameClock >= 1.0f / GIF_FPS)
+                {
+                    frameClock = fmodf(frameClock, 1.0f / GIF_FPS);
+                    ShowFrame((frameIndex + 1) % frameCount);
+                }
+            }
+        }
+
+        if (poseMode && hasImage)
+            UpdatePoseEditor();
+
+        if (IsKeyPressed(KEY_L))
+            autoLight = !autoLight;
+
+        if (IsKeyDown(KEY_UP))
+            lightStrength += 3.0f * dt;
+
+        if (IsKeyDown(KEY_DOWN))
+            lightStrength -= 3.0f * dt;
+
+        if (IsKeyDown(KEY_RIGHT))
+            lightSpeed += 0.5f * dt;
+
+        if (IsKeyDown(KEY_LEFT))
+            lightSpeed -= 0.5f * dt;
+
+        if (lightStrength < 0.0f) lightStrength = 0.0f;
+        if (lightStrength > 15.0f) lightStrength = 15.0f;
+        if (lightSpeed < 0.0f) lightSpeed = 0.0f;
+        if (lightSpeed > 5.0f) lightSpeed = 5.0f;
+
+        Vector2 mouse = GetMousePosition();
+
+        bool mouseOverScene =
+            mouse.y >= Ui(SCENE_TOP) &&
+            mouse.y < (float)GetScreenHeight() - Ui(SCENE_BOTTOM);
+
+        bool draggingLights =
+            IsMouseButtonDown(MOUSE_BUTTON_LEFT) && mouseOverScene && !poseMode;
+
+        if (autoLight && !draggingLights)
+        {
+            lightAngle += dt * lightSpeed;
+            verticalLightAngle += dt * lightSpeed * 1.2f;
+        }
+
+        Vector3 baseLight1 = GetFirstLightPosition(camera, lightAngle);
+        Vector3 baseLight2 = GetSecondLightPosition(
+            camera, verticalLightAngle
+        );
+
+        Vector3 lightPosition1 = baseLight1;
+        Vector3 lightPosition2 = baseLight2;
+
+        if (draggingLights)
+        {
+            Vector3 draggedPosition;
+
+            if (GetDraggedLightPosition(camera, mouse, &draggedPosition))
+            {
+                Vector3 offset = Vector3Subtract(
+                    draggedPosition, baseLight1
+                );
+
+                lightPosition1 = draggedPosition;
+                lightPosition2 = Vector3Add(baseLight2, offset);
+            }
+        }
+
+        Vector3 lightLocal1 = WorldLightToBillboard(
+            camera, lightPosition1
+        );
+
+        Vector3 lightLocal2 = WorldLightToBillboard(
+            camera, lightPosition2
+        );
+
+        SetShaderValue(
+            lightShader, locLight1,
+            &lightLocal1, SHADER_UNIFORM_VEC3
+        );
+
+        SetShaderValue(
+            lightShader, locLight2,
+            &lightLocal2, SHADER_UNIFORM_VEC3
+        );
+
+        SetShaderValue(
+            lightShader, locColor1,
+            lightColor1, SHADER_UNIFORM_VEC3
+        );
+
+        SetShaderValue(
+            lightShader, locColor2,
+            lightColor2, SHADER_UNIFORM_VEC3
+        );
+
+        SetShaderValue(
+            lightShader, locBoardSize,
+            &billboardSize, SHADER_UNIFORM_VEC2
+        );
+
+        SetShaderValue(
+            lightShader, locStrength,
+            &lightStrength, SHADER_UNIFORM_FLOAT
+        );
+
+        BeginDrawing();
+        ClearBackground((Color){ 17, 20, 29, 255 });
+
+        if (poseMode)
+            DrawPoseView();
+        else
+            DrawScene3D(camera, lightPosition1, lightPosition2, locNormalMap);
+
+        float screenW = (float)GetScreenWidth();
+        float screenH = (float)GetScreenHeight();
+
+        DrawRectangleRec(
+            (Rectangle){ 0.0f, 0.0f, screenW, Ui(SCENE_TOP) },
+            (Color){ 9, 12, 19, 225 }
+        );
+
+        DrawUiText("NORMALS 3D", Ui(24.0f), Ui(16.0f), TEXT_TITLE, RAYWHITE);
+
+        DrawUiText(
+            hasImage
+                ? (poseMode
+                    ? "Editor de poses | OpenPose 18"
+                    : (showNormals
+                        ? "Billboard 3D | Mapa de normales"
+                        : "Billboard 3D | Dos luces en tiempo real"))
+                : "Arrastra una imagen o GIF a esta ventana",
+            Ui(24.0f), Ui(52.0f), TEXT_HEADING, SKYBLUE
+        );
+
+        DrawUiText(statusText, Ui(24.0f), Ui(80.0f), TEXT_SMALL, GRAY);
+
+        if (hasImage && frameCount > 1)
+            DrawTimeline();
+
+        if (hasImage)
+            DrawUiTextRight(
+                TextFormat("FRAME %d/%d", frameIndex + 1, frameCount),
+                screenW - Ui(24.0f), Ui(52.0f), TEXT_HEADING, RAYWHITE
+            );
+
+        DrawUiTextRight(
+            draggingLights ? "LUCES: MANUALES" :
+                (autoLight ? "LUCES: AUTOMATICAS" : "LUCES: PAUSADAS"),
+            screenW - Ui(24.0f), Ui(22.0f), TEXT_HEADING,
+            draggingLights ? WHITE : (autoLight ? GOLD : LIGHTGRAY)
+        );
+
+        DrawRectangleRec(
+            (Rectangle){ 0.0f, screenH - Ui(SCENE_BOTTOM), screenW, Ui(SCENE_BOTTOM) },
+            (Color){ 9, 12, 19, 225 }
+        );
+
+        DrawUiText(
+            "Arrastrar o Ctrl+V ruta | ESPACIO: normales | L: luces | P: poses | G: animar | A D o , . : frame | barra superior",
+            Ui(20.0f), screenH - Ui(82.0f), TEXT_BODY, RAYWHITE
+        );
+
+        DrawUiText(
+            poseMode
+                ? "Clic izquierdo + arrastrar: mover articulacion | R: redetectar | J: exportar JSON | Z: depth map"
+                : "Clic izquierdo + arrastrar: mover las dos luces",
+            Ui(20.0f), screenH - Ui(59.0f), TEXT_BODY, LIGHTGRAY
+        );
+
+        DrawUiText(
+            "Boton derecho + arrastrar: camara | Rueda: zoom",
+            Ui(20.0f), screenH - Ui(36.0f), TEXT_BODY, LIGHTGRAY
+        );
+
+        DrawUiText(
+            TextFormat(
+                "Intensidad %.1f | Velocidad %.1f",
+                lightStrength, lightSpeed
+            ),
+            Ui(20.0f), screenH - Ui(17.0f), TEXT_SMALL, GRAY
+        );
+
+        DrawUiTextRight(
+            TextFormat("%d FPS", GetFPS()),
+            screenW - Ui(24.0f), screenH - Ui(17.0f), TEXT_SMALL, GRAY
+        );
+
+        EndDrawing();
+    }
+
+    if (hasImage)
+        UnloadSprite();
+
+    if (UiFontIsCustom())
+        UnloadFont(uiFont);
+
+    UnloadShader(lightShader);
+    PoseModelClose(&poseModel);
+    CloseWindow();
+
+    return 0;
+}
