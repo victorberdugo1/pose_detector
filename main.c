@@ -1,6 +1,7 @@
 
 #include "raylib.h"
 #include "raymath.h"
+#include "rlgl.h"
 #include "pose.h"
 #include "pose_model.h"
 #include <ctype.h>
@@ -18,10 +19,27 @@
 #define LIGHT_DEPTH 2.0f
 #define DRAG_LIGHT_DISTANCE 2.0f
 #define GIF_FPS 10.0f
+#define EXPORT_EMPTY_FRAMES_DEFAULT 2
+#define EXPORT_EMPTY_FRAMES_MAX 10
+#define EXPORT_GAP_WIDTH 170.0f
+#define EXPORT_GAP_BUTTON 28.0f
 #define POSE_PICK_RADIUS 12.0f
+#define LIGHT_COUNT 3
+#define OPPOSITE_LIGHT_ANGLE 3.14159265f
 #define SCENE_TOP 112.0f
 #define SCENE_BOTTOM 94.0f
 #define SIDE_PANEL_RATIO 0.3f
+#define SIDE_Z_MARGIN 1.1f
+#define SIDE_ROTATE_SPEED 0.01f
+#define SIDE_RETURN_RATE 14.0f
+#define SIDE_YAW_EPSILON 0.01f
+#define SIDE_BACK_TINT (Color){ 45, 45, 55, 255 }
+#define BODY_ALPHA 110
+#define BODY_UPPER_ARM_RADIUS 0.04f
+#define BODY_FOREARM_RADIUS 0.032f
+#define BODY_THIGH_RADIUS 0.06f
+#define BODY_CALF_RADIUS 0.045f
+#define BODY_TORSO_RADIUS 0.075f
 
 #define TEXT_TITLE 28.0f
 #define TEXT_HEADING 18.0f
@@ -47,11 +65,14 @@ static unsigned char *depthPixels = NULL;
 static Texture2D depthTexture = { 0 };
 static Pose *poses = NULL;
 static PoseLimbs limbs = { 0 };
+static PoseFlips *frameFlips = NULL;
 static int frameCount = 0;
 static int frameIndex = 0;
 static float frameClock = 0.0f;
 static int dragJoint = -1;
 static bool dragSide = false;
+static bool sideRotating = false;
+static float sideYaw = 0.0f;
 static bool scrubbing = false;
 static char spritePath[512] = "";
 
@@ -60,9 +81,10 @@ static bool showNormals = false;
 static bool autoLight = true;
 static bool playing = true;
 static bool poseMode = false;
+static int exportEmptyFrames = EXPORT_EMPTY_FRAMES_DEFAULT;
 static bool showDepth = false;
 
-static float lightStrength = 2.0f;
+static float lightStrength = 1.5f;
 static float lightSpeed = 1.0f;
 static float lightAngle = 0.0f;
 static float verticalLightAngle = 0.0f;
@@ -92,6 +114,8 @@ static const char *fragmentShader =
     "uniform vec3 lightLocal2;\n"
     "uniform vec3 lightColor1;\n"
     "uniform vec3 lightColor2;\n"
+    "uniform vec3 lightLocal3;\n"
+    "uniform vec3 lightColor3;\n"
     "uniform vec2 boardSize;\n"
     "uniform float strength;\n"
     "out vec4 finalColor;\n"
@@ -116,9 +140,15 @@ static const char *fragmentShader =
     "    float diffuse2 = max(dot(n, L2), 0.0);\n"
     "    float atten1 = 1.0 / (1.0 + 0.08 * dist1);\n"
     "    float atten2 = 1.0 / (1.0 + 0.08 * dist2);\n"
+    "    vec3 delta3 = lightLocal3 - surface;\n"
+    "    float dist3 = max(dot(delta3, delta3), 0.001);\n"
+    "    vec3 L3 = normalize(delta3);\n"
+    "    float diffuse3 = max(dot(n, L3), 0.0);\n"
+    "    float atten3 = 1.0 / (1.0 + 0.08 * dist3);\n"
     "    vec3 lighting = vec3(0.18);\n"
     "    lighting += strength * diffuse1 * atten1 * lightColor1;\n"
     "    lighting += strength * diffuse2 * atten2 * lightColor2;\n"
+    "    lighting += strength * diffuse3 * atten3 * lightColor3;\n"
     "    lighting = clamp(lighting, vec3(0.0), vec3(1.8));\n"
     "    finalColor = vec4(albedo.rgb * lighting, albedo.a) * fragColor;\n"
     "}\n";
@@ -221,8 +251,8 @@ static Image GenerateNormalMap(Image src)
             float up = GetHeight(GetImageColor(src, x, yu));
             float down = GetHeight(GetImageColor(src, x, yd));
 
-            float nx = (left - right) * 4.0f;
-            float ny = (down - up) * 4.0f;
+            float nx = (left - right) * 7.0f;
+            float ny = (down - up) * 7.0f;
             float nz = 1.0f;
 
             float len = sqrtf(nx * nx + ny * ny + nz * nz);
@@ -349,11 +379,13 @@ static void UnloadSprite(void)
     free(depthPixels);
     free(depthMaps);
     free(poses);
+    free(frameFlips);
     sprite = (Image){ 0 };
     normalFrames = NULL;
     depthMaps = NULL;
     depthPixels = NULL;
     poses = NULL;
+    frameFlips = NULL;
     hasImage = false;
 }
 
@@ -390,13 +422,15 @@ static bool LoadDroppedImage(const char *path)
     size_t bytes = (size_t)anim.width * anim.height * 4;
     unsigned char *newNormals = malloc(bytes * frames);
     Pose *newPoses = calloc(frames, sizeof(Pose));
+    PoseFlips *newFlips = calloc(frames, sizeof(PoseFlips));
     size_t depthCells = PoseDepthCells(anim.width, anim.height);
     float *newDepth = malloc(depthCells * frames * sizeof(float));
     unsigned char *newDepthPixels = malloc(depthCells * 4);
     float newSpan = 0.0f;
 
-    if (newNormals == NULL || newPoses == NULL || newDepth == NULL || newDepthPixels == NULL)
+    if (newNormals == NULL || newPoses == NULL || newDepth == NULL || newDepthPixels == NULL || newFlips == NULL)
     {
+        free(newFlips);
         free(newNormals);
         free(newDepth);
         free(newDepthPixels);
@@ -463,6 +497,7 @@ static bool LoadDroppedImage(const char *path)
         free(newDepth);
         free(newDepthPixels);
         free(newPoses);
+        free(newFlips);
         UnloadImage(anim);
 
         snprintf(statusText, sizeof(statusText),
@@ -484,6 +519,7 @@ static bool LoadDroppedImage(const char *path)
     depthPixels = newDepthPixels;
     depthTexture = newDepthTexture;
     poses = newPoses;
+    frameFlips = newFlips;
     limbs = newLimbs;
     frameCount = frames;
     frameIndex = 0;
@@ -676,6 +712,7 @@ static void DrawScene3D(
     Camera3D camera,
     Vector3 light1,
     Vector3 light2,
+    Vector3 light3,
     int locNormalMap)
 {
     BeginMode3D(camera);
@@ -708,6 +745,11 @@ static void DrawScene3D(
     DrawSphere(
         light2, 0.16f,
         (Color){ 150, 195, 255, 255 }
+    );
+
+    DrawSphere(
+        light3, 0.16f,
+        (Color){ 255, 80, 80, 255 }
     );
 
     if (hasImage)
@@ -796,18 +838,108 @@ static Vector2 PoseToScreen(Rectangle view, PosePoint p)
 
 static float SideZRange(Rectangle side, Rectangle view)
 {
-    return SideHalfWidth(side) / view.height;
+    float range = SideHalfWidth(side) / view.height;
+
+    for (int i = 0; i < frameCount; i++)
+    {
+        if (!poses[i].valid)
+            continue;
+
+        for (int j = 0; j < POSE_JOINTS; j++)
+            range = fmaxf(range, fabsf(poses[i].p[j].z - 0.5f) * SIDE_Z_MARGIN);
+    }
+
+    return range;
 }
 
-static Vector2 PoseToSide(Rectangle side, Rectangle view, PosePoint p)
+static float SideScale(Rectangle side, Rectangle view)
 {
-    float range = SideZRange(side, view);
-    float z = Clamp(p.z - 0.5f, -range, range);
+    return SideHalfWidth(side) / SideZRange(side, view);
+}
+
+static float SidePivot(const Pose *pose)
+{
+    return (pose->p[POSE_LHIP].x + pose->p[POSE_RHIP].x) * 0.5f;
+}
+
+static Vector2 PoseToSide(Rectangle side, Rectangle view, float pivot, PosePoint p)
+{
+    float depth = -(p.z - 0.5f) * SideScale(side, view);
+    float lateral = (p.x - pivot) * view.width / sprite.width;
 
     return (Vector2){
-        side.x + side.width * 0.5f - z * view.height,
+        side.x + side.width * 0.5f + depth * cosf(sideYaw) + lateral * sinf(sideYaw),
         PoseToScreen(view, p).y
     };
+}
+
+static const Color JointColors[POSE_JOINTS] = {
+    [POSE_NOSE] = { 255, 215, 0, 255 },
+    [POSE_NECK] = { 255, 150, 0, 255 },
+    [POSE_LEYE] = { 140, 220, 255, 255 },
+    [POSE_LEAR] = { 0, 100, 200, 255 },
+    [POSE_LSHOULDER] = { 0, 70, 255, 255 },
+    [POSE_LELBOW] = { 0, 160, 255, 255 },
+    [POSE_LWRIST] = { 0, 235, 235, 255 },
+    [POSE_LHIP] = { 90, 60, 255, 255 },
+    [POSE_LKNEE] = { 150, 110, 255, 255 },
+    [POSE_LANKLE] = { 205, 175, 255, 255 },
+    [POSE_REYE] = { 255, 170, 170, 255 },
+    [POSE_REAR] = { 150, 0, 0, 255 },
+    [POSE_RSHOULDER] = { 255, 30, 30, 255 },
+    [POSE_RELBOW] = { 255, 115, 0, 255 },
+    [POSE_RWRIST] = { 255, 60, 160, 255 },
+    [POSE_RHIP] = { 200, 0, 70, 255 },
+    [POSE_RKNEE] = { 255, 95, 125, 255 },
+    [POSE_RANKLE] = { 255, 165, 205, 255 }
+};
+
+static Color JointColor(int joint)
+{
+    return JointColors[joint];
+}
+
+static Color BoneColor(int bone)
+{
+    Color c = JointColor(PoseBones[bone][1]);
+
+    return (Color){ (unsigned char)(c.r * 0.6f), (unsigned char)(c.g * 0.6f), (unsigned char)(c.b * 0.6f), 255 };
+}
+
+static void DrawBodyEllipse(Vector2 a, Vector2 b, float radius, Color color)
+{
+    Vector2 mid = Vector2Scale(Vector2Add(a, b), 0.5f);
+    float angle = atan2f(b.y - a.y, b.x - a.x) * RAD2DEG;
+
+    color.a = BODY_ALPHA;
+    rlPushMatrix();
+    rlTranslatef(mid.x, mid.y, 0.0f);
+    rlRotatef(angle, 0.0f, 0.0f, 1.0f);
+    DrawEllipse(0, 0, Vector2Distance(a, b) * 0.5f + radius * 0.5f, radius, color);
+    rlPopMatrix();
+}
+
+static void DrawBodyVolume(const Pose *pose, const Vector2 *p, float scale)
+{
+    const float armRadius[2] = { BODY_UPPER_ARM_RADIUS, BODY_FOREARM_RADIUS };
+    const float legRadius[2] = { BODY_THIGH_RADIUS, BODY_CALF_RADIUS };
+    float height = pose->height * scale;
+    Vector2 pelvis = Vector2Scale(Vector2Add(p[POSE_LHIP], p[POSE_RHIP]), 0.5f);
+    Vector2 head = { 0.0f, 0.0f };
+
+    DrawBodyEllipse(p[POSE_NECK], pelvis, BODY_TORSO_RADIUS * height, JointColor(POSE_NECK));
+
+    for (int k = 0; k < 2; k++)
+        for (int s = 0; s < 2; s++)
+        {
+            DrawBodyEllipse(p[PoseArms[k][s]], p[PoseArms[k][s + 1]], armRadius[s] * height, JointColor(PoseArms[k][s + 1]));
+            DrawBodyEllipse(p[PoseLegs[k][s]], p[PoseLegs[k][s + 1]], legRadius[s] * height, JointColor(PoseLegs[k][s + 1]));
+        }
+
+    for (size_t i = 0; i < sizeof PoseHead / sizeof PoseHead[0]; i++)
+        head = Vector2Add(head, Vector2Scale(p[PoseHead[i]], 1.0f / (sizeof PoseHead / sizeof PoseHead[0])));
+
+    DrawBodyEllipse(head, head, POSE_HEAD_RADIUS * height, JointColor(POSE_NOSE));
 }
 
 static void ExportPoses(void)
@@ -819,9 +951,129 @@ static void ExportPoses(void)
     );
 
     snprintf(statusText, sizeof(statusText),
-             PoseWriteJson(out, poses, frameCount, sprite.width, sprite.height)
+             PoseWriteJson(out, poses, frameCount, sprite.width, sprite.height, exportEmptyFrames)
                  ? "Exportado: %s" : "No se pudo escribir: %s",
              GetFileName(out));
+}
+
+static Rectangle ExportGapRect(void)
+{
+    return (Rectangle){
+        (float)GetScreenWidth() - Ui(24.0f) - Ui(EXPORT_GAP_WIDTH),
+        Ui(78.0f), Ui(EXPORT_GAP_WIDTH), Ui(EXPORT_GAP_BUTTON)
+    };
+}
+
+static Rectangle ExportGapButton(bool plus)
+{
+    Rectangle rect = ExportGapRect();
+
+    return (Rectangle){
+        plus ? rect.x + rect.width - Ui(EXPORT_GAP_BUTTON) : rect.x,
+        rect.y, Ui(EXPORT_GAP_BUTTON), rect.height
+    };
+}
+
+static void UpdateExportGap(void)
+{
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        return;
+
+    Vector2 mouse = GetMousePosition();
+
+    if (CheckCollisionPointRec(mouse, ExportGapButton(false)) && exportEmptyFrames > 0)
+        exportEmptyFrames--;
+
+    if (CheckCollisionPointRec(mouse, ExportGapButton(true)) && exportEmptyFrames < EXPORT_EMPTY_FRAMES_MAX)
+        exportEmptyFrames++;
+}
+
+static void DrawExportGapButton(Rectangle rect, const char *text)
+{
+    Color background = CheckCollisionPointRec(GetMousePosition(), rect)
+        ? (Color){ 70, 80, 100, 255 }
+        : (Color){ 45, 52, 68, 255 };
+
+    DrawRectangleRec(rect, background);
+    DrawUiText(
+        text,
+        rect.x + (rect.width - MeasureUiText(text, TEXT_HEADING)) * 0.5f,
+        rect.y + Ui(2.0f),
+        TEXT_HEADING, RAYWHITE
+    );
+}
+
+static void DrawExportGap(void)
+{
+    Rectangle minus = ExportGapButton(false);
+    Rectangle plus = ExportGapButton(true);
+    const char *label = TextFormat("Vacios: %d", exportEmptyFrames);
+    float left = minus.x + minus.width;
+    float labelX = left + (plus.x - left - MeasureUiText(label, TEXT_BODY)) * 0.5f;
+
+    DrawExportGapButton(minus, "-");
+    DrawExportGapButton(plus, "+");
+    DrawUiText(label, labelX, Ui(82.0f), TEXT_BODY, RAYWHITE);
+}
+
+static void RedetectPose(int index)
+{
+    Pose *pose = &poses[index];
+    PoseLimbs frameLimbs = limbs;
+
+    frameLimbs.flips = frameFlips[index];
+    DetectPose(
+        FrameView(sprite.data, sprite.width, sprite.height, index).data,
+        sprite.width, sprite.height, pose
+    );
+    PoseFitLimbs(pose, &frameLimbs);
+    RefreshPoseDepth(index);
+}
+
+static void ReloadPoses(void)
+{
+    if (!poses[frameIndex].valid)
+    {
+        snprintf(statusText, sizeof(statusText),
+                 "El frame %d no tiene pose de referencia", frameIndex + 1);
+        return;
+    }
+
+    PoseAdoptDepth(&poses[frameIndex], sprite.height);
+    limbs = PoseReferenceLimbs(&poses[frameIndex]);
+
+    for (int i = frameIndex + 1; i < frameCount; i++)
+    {
+        frameFlips[i] = (PoseFlips){ { 0 }, 0 };
+        RedetectPose(i);
+        frameFlips[i] = PoseLearnFlips(&poses[i - 1], &poses[i]);
+        RedetectPose(i);
+    }
+
+    snprintf(statusText, sizeof(statusText),
+             "Animacion recalculada desde el frame %d", frameIndex + 1);
+}
+
+static void MoveJoints(Pose *pose, int joint, float dx, float dy, float dz, float range)
+{
+    bool head = joint == POSE_NOSE;
+    int count = head ? (int)(sizeof PoseHead / sizeof PoseHead[0]) : 1;
+
+    for (int i = 0; i < count; i++)
+    {
+        PosePoint *p = &pose->p[head ? (int)PoseHead[i] : joint];
+
+        p->x = Clamp(p->x + dx, 0.0f, sprite.width - 1.0f);
+        p->y = Clamp(p->y + dy, 0.0f, sprite.height - 1.0f);
+
+        if (dz != 0.0f)
+        {
+            float z = Clamp(p->z + dz, 0.5f - range, 0.5f + range);
+
+            p->dz += z - p->z;
+            p->z = z;
+        }
+    }
 }
 
 static void UpdatePoseEditor(void)
@@ -831,14 +1083,7 @@ static void UpdatePoseEditor(void)
     Pose *pose = &poses[frameIndex];
 
     if (IsKeyPressed(KEY_R))
-    {
-        DetectPose(
-            FrameView(sprite.data, sprite.width, sprite.height, frameIndex).data,
-            sprite.width, sprite.height, pose
-        );
-        PoseFitLimbs(pose, &limbs);
-        RefreshPoseDepth(frameIndex);
-    }
+        ReloadPoses();
 
     if (IsKeyPressed(KEY_J))
         ExportPoses();
@@ -858,7 +1103,9 @@ static void UpdatePoseEditor(void)
         for (int j = 0; j < POSE_JOINTS; j++)
         {
             float dMain = Vector2Distance(mouse, PoseToScreen(view, pose->p[j]));
-            float dSide = Vector2Distance(mouse, PoseToSide(side, view, pose->p[j]));
+            float dSide = fabsf(sideYaw) < SIDE_YAW_EPSILON
+                ? Vector2Distance(mouse, PoseToSide(side, view, SidePivot(pose), pose->p[j]))
+                : INFINITY;
 
             if (dMain < best)
             {
@@ -876,28 +1123,60 @@ static void UpdatePoseEditor(void)
         }
     }
 
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid && dragJoint < 0)
+        sideRotating = CheckCollisionPointRec(mouse, side);
+
     if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+    {
         dragJoint = -1;
+        sideRotating = false;
+    }
+
+    if (sideRotating)
+        sideYaw += GetMouseDelta().x * SIDE_ROTATE_SPEED;
+    else
+        sideYaw *= expf(-SIDE_RETURN_RATE * GetFrameTime());
 
     if (dragJoint >= 0 && dragSide)
     {
-        PosePoint *p = &pose->p[dragJoint];
         float range = SideZRange(side, view);
-        float z = 0.5f - (mouse.x - side.x - side.width * 0.5f) / view.height;
+        float z = 0.5f - (mouse.x - side.x - side.width * 0.5f) / SideScale(side, view);
 
-        z = Clamp(z, 0.5f - range, 0.5f + range);
-        p->dz += z - p->z;
-        p->z = z;
+        MoveJoints(pose, dragJoint, 0.0f, 0.0f, Clamp(z, 0.5f - range, 0.5f + range) - pose->p[dragJoint].z, range);
     }
     else if (dragJoint >= 0)
     {
         float scale = view.width / sprite.width;
+        float x = Clamp((mouse.x - view.x) / scale, 0.0f, sprite.width - 1.0f);
+        float y = Clamp((mouse.y - view.y) / scale, 0.0f, sprite.height - 1.0f);
 
-        pose->p[dragJoint].x = Clamp((mouse.x - view.x) / scale, 0.0f, sprite.width - 1.0f);
-        pose->p[dragJoint].y = Clamp((mouse.y - view.y) / scale, 0.0f, sprite.height - 1.0f);
-
+        MoveJoints(pose, dragJoint, x - pose->p[dragJoint].x, y - pose->p[dragJoint].y, 0.0f, 0.0f);
         RefreshPoseDepth(frameIndex);
     }
+}
+
+static void DrawSideBillboard(Rectangle side, Rectangle view, float pivot, Rectangle source)
+{
+    float scale = view.width / sprite.width;
+    float shear = sinf(sideYaw);
+    float left = side.x + side.width * 0.5f - pivot * scale * shear;
+    float right = left + view.width * shear;
+    Rectangle dest = { fminf(left, right), view.y, fabsf(right - left), view.height };
+
+    if (dest.width < 1.0f)
+        return;
+
+    Color tint = WHITE;
+
+    if (shear < 0.0f)
+    {
+        source.width = -source.width;
+        tint = SIDE_BACK_TINT;
+    }
+
+    BeginScissorMode((int)side.x, (int)side.y, (int)side.width, (int)side.height);
+    DrawTexturePro(originalTexture, source, dest, (Vector2){ 0.0f, 0.0f }, 0.0f, tint);
+    EndScissorMode();
 }
 
 static void DrawPoseView(void)
@@ -929,7 +1208,7 @@ static void DrawPoseView(void)
                  t == 0 ? (Color){ 90, 100, 125, 255 } : (Color){ 52, 58, 74, 255 });
     }
 
-    DrawUiText("Vista lateral (z) | arrastrar para editar", side.x + Ui(10.0f), side.y + Ui(8.0f), TEXT_BODY, RAYWHITE);
+    DrawUiText("Vista lateral (z) | fondo: girar", side.x + Ui(10.0f), side.y + Ui(8.0f), TEXT_BODY, RAYWHITE);
     DrawUiText("lejos", side.x + Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
     DrawUiTextRight("cerca", side.x + side.width - Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
 
@@ -938,17 +1217,21 @@ static void DrawPoseView(void)
     if (!pose->valid)
         return;
 
+    DrawSideBillboard(side, view, SidePivot(pose), source);
+
     Vector2 sidePoint[POSE_JOINTS];
 
     for (int j = 0; j < POSE_JOINTS; j++)
-        sidePoint[j] = PoseToSide(side, view, pose->p[j]);
+        sidePoint[j] = PoseToSide(side, view, SidePivot(pose), pose->p[j]);
+
+    DrawBodyVolume(pose, sidePoint, view.width / sprite.width);
 
     for (int i = 0; i < POSE_BONE_COUNT; i++)
-        DrawLineEx(sidePoint[PoseBones[i][0]], sidePoint[PoseBones[i][1]], Ui(3.0f), (Color){ 80, 255, 120, 255 });
+        DrawLineEx(sidePoint[PoseBones[i][0]], sidePoint[PoseBones[i][1]], Ui(3.0f), BoneColor(i));
 
     for (int j = 0; j < POSE_JOINTS; j++)
     {
-        DrawCircleV(sidePoint[j], Ui(j == dragJoint && dragSide ? 9.0f : 7.0f), ColorFromHSV(j * 20.0f, 0.85f, 1.0f));
+        DrawCircleV(sidePoint[j], Ui(j == dragJoint && dragSide ? 9.0f : 7.0f), JointColor(j));
         DrawCircleLinesV(sidePoint[j], Ui(7.0f), BLACK);
     }
 
@@ -962,14 +1245,14 @@ static void DrawPoseView(void)
         DrawLineEx(
             PoseToScreen(view, pose->p[PoseBones[i][0]]),
             PoseToScreen(view, pose->p[PoseBones[i][1]]),
-            Ui(2.0f), (Color){ 80, 255, 120, 255 }
+            Ui(2.0f), BoneColor(i)
         );
 
     for (int j = 0; j < POSE_JOINTS; j++)
     {
         Vector2 p = PoseToScreen(view, pose->p[j]);
 
-        DrawCircleV(p, Ui(j == dragJoint ? 7.0f : 5.0f), ColorFromHSV(j * 20.0f, 0.85f, 1.0f));
+        DrawCircleV(p, Ui(j == dragJoint ? 7.0f : 5.0f), JointColor(j));
         DrawCircleLinesV(p, Ui(5.0f), BLACK);
     }
 }
@@ -1056,14 +1339,17 @@ int main(int argc, char **argv)
 
     int locLight1 = GetShaderLocation(lightShader, "lightLocal1");
     int locLight2 = GetShaderLocation(lightShader, "lightLocal2");
+    int locLight3 = GetShaderLocation(lightShader, "lightLocal3");
     int locColor1 = GetShaderLocation(lightShader, "lightColor1");
     int locColor2 = GetShaderLocation(lightShader, "lightColor2");
+    int locColor3 = GetShaderLocation(lightShader, "lightColor3");
     int locBoardSize = GetShaderLocation(lightShader, "boardSize");
     int locStrength = GetShaderLocation(lightShader, "strength");
     int locNormalMap = GetShaderLocation(lightShader, "normalMap");
 
     float lightColor1[3] = { 1.0f, 0.82f, 0.55f };
     float lightColor2[3] = { 0.55f, 0.75f, 1.0f };
+    float lightColor3[3] = { 1.0f, 0.2f, 0.2f };
 
     if (argc > 1)
         LoadImageFromPathText(argv[1]);
@@ -1142,7 +1428,10 @@ int main(int argc, char **argv)
         }
 
         if (poseMode && hasImage)
+        {
+            UpdateExportGap();
             UpdatePoseEditor();
+        }
 
         if (IsKeyPressed(KEY_L))
             autoLight = !autoLight;
@@ -1179,13 +1468,15 @@ int main(int argc, char **argv)
             verticalLightAngle += dt * lightSpeed * 1.2f;
         }
 
-        Vector3 baseLight1 = GetFirstLightPosition(camera, lightAngle);
-        Vector3 baseLight2 = GetSecondLightPosition(
-            camera, verticalLightAngle
-        );
+        Vector3 lightOrbit[LIGHT_COUNT] = {
+            GetFirstLightPosition(camera, lightAngle),
+            GetSecondLightPosition(camera, verticalLightAngle),
+            GetFirstLightPosition(camera, lightAngle + OPPOSITE_LIGHT_ANGLE)
+        };
 
-        Vector3 lightPosition1 = baseLight1;
-        Vector3 lightPosition2 = baseLight2;
+        Vector3 lightPosition[LIGHT_COUNT] = {
+            lightOrbit[0], lightOrbit[1], lightOrbit[2]
+        };
 
         if (draggingLights)
         {
@@ -1193,22 +1484,20 @@ int main(int argc, char **argv)
 
             if (GetDraggedLightPosition(camera, mouse, &draggedPosition))
             {
-                Vector3 offset = Vector3Subtract(
-                    draggedPosition, baseLight1
+                Vector3 center = Vector3Scale(
+                    Vector3Add(Vector3Add(lightOrbit[0], lightOrbit[1]), lightOrbit[2]),
+                    1.0f / LIGHT_COUNT
                 );
+                Vector3 offset = Vector3Subtract(draggedPosition, center);
 
-                lightPosition1 = draggedPosition;
-                lightPosition2 = Vector3Add(baseLight2, offset);
+                for (int i = 0; i < LIGHT_COUNT; i++)
+                    lightPosition[i] = Vector3Add(lightOrbit[i], offset);
             }
         }
 
-        Vector3 lightLocal1 = WorldLightToBillboard(
-            camera, lightPosition1
-        );
-
-        Vector3 lightLocal2 = WorldLightToBillboard(
-            camera, lightPosition2
-        );
+        Vector3 lightLocal1 = WorldLightToBillboard(camera, lightPosition[0]);
+        Vector3 lightLocal2 = WorldLightToBillboard(camera, lightPosition[1]);
+        Vector3 lightLocal3 = WorldLightToBillboard(camera, lightPosition[2]);
 
         SetShaderValue(
             lightShader, locLight1,
@@ -1221,6 +1510,11 @@ int main(int argc, char **argv)
         );
 
         SetShaderValue(
+            lightShader, locLight3,
+            &lightLocal3, SHADER_UNIFORM_VEC3
+        );
+
+        SetShaderValue(
             lightShader, locColor1,
             lightColor1, SHADER_UNIFORM_VEC3
         );
@@ -1228,6 +1522,11 @@ int main(int argc, char **argv)
         SetShaderValue(
             lightShader, locColor2,
             lightColor2, SHADER_UNIFORM_VEC3
+        );
+
+        SetShaderValue(
+            lightShader, locColor3,
+            lightColor3, SHADER_UNIFORM_VEC3
         );
 
         SetShaderValue(
@@ -1246,7 +1545,7 @@ int main(int argc, char **argv)
         if (poseMode)
             DrawPoseView();
         else
-            DrawScene3D(camera, lightPosition1, lightPosition2, locNormalMap);
+            DrawScene3D(camera, lightPosition[0], lightPosition[1], lightPosition[2], locNormalMap);
 
         float screenW = (float)GetScreenWidth();
         float screenH = (float)GetScreenHeight();
@@ -1270,6 +1569,9 @@ int main(int argc, char **argv)
         );
 
         DrawUiText(statusText, Ui(24.0f), Ui(80.0f), TEXT_SMALL, GRAY);
+
+        if (poseMode)
+            DrawExportGap();
 
         if (hasImage && frameCount > 1)
             DrawTimeline();
@@ -1300,7 +1602,7 @@ int main(int argc, char **argv)
         DrawUiText(
             poseMode
                 ? "Clic izquierdo + arrastrar: mover articulacion | R: redetectar | J: exportar JSON | Z: depth map"
-                : "Clic izquierdo + arrastrar: mover las dos luces",
+                : "Clic izquierdo + arrastrar: mover las tres luces",
             Ui(20.0f), screenH - Ui(59.0f), TEXT_BODY, LIGHTGRAY
         );
 

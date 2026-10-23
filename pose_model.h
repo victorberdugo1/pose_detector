@@ -128,8 +128,8 @@ static int PoseModelOpen(PoseModel *m, const char *task)
     m->file = zip;
     if (!pose_zip_entry(zip, zipSize, POSE_MODEL_ENTRY, &data, &dataSize)) goto fail;
 
-    LiteRtOptions options = NULL;
-    LiteRtSignature signature = NULL;
+    LiteRtOptions options;
+    LiteRtSignature signature;
     LiteRtLayout inputLayout;
     if (!pose_check(LiteRtCreateEnvironment(0, NULL, &m->env))) goto fail;
     if (!pose_check(LiteRtCreateModelFromBuffer(m->env, data, dataSize, &m->model))) goto fail;
@@ -149,9 +149,9 @@ static int PoseModelOpen(PoseModel *m, const char *task)
 
     if (!pose_check(LiteRtGetModelSignature(m->model, 0, &signature))) goto fail;
     for (int k = 0; k < POSE_MODEL_OUTPUTS; k++) {
-        LiteRtTensor tensor = NULL;
+        LiteRtTensor tensor;
         LiteRtRankedTensorType type;
-        LiteRtTensorBufferRequirements requirements = NULL;
+        LiteRtTensorBufferRequirements requirements;
         if (!pose_check(LiteRtGetSignatureOutputTensorByIndex(signature, k, &tensor))) goto fail;
         if (!pose_check(LiteRtGetRankedTensorType(tensor, &type))) goto fail;
         if (!pose_check(LiteRtGetCompiledModelOutputBufferRequirements(m->compiled, 0, k, &requirements))) goto fail;
@@ -221,7 +221,7 @@ static int PoseModelDetect(PoseModel *m, const uint8_t *rgba, int w, int h, Pose
     float cx = (x0 + x1 + 1) * 0.5f, cy = (y0 + y1 + 1) * 0.5f;
     float size = fmaxf(bw, bh) * POSE_MODEL_ROI_SCALE;
 
-    float *in = NULL;
+    float *in;
     if (!pose_check(LiteRtLockTensorBuffer(m->input, (void **)&in, kLiteRtTensorBufferLockModeWrite))) return 0;
     pose_model_fill_input(rgba, w, h, cx, cy, size, in);
     LiteRtUnlockTensorBuffer(m->input);
@@ -229,7 +229,7 @@ static int PoseModelDetect(PoseModel *m, const uint8_t *rgba, int w, int h, Pose
     LiteRtTensorBuffer inputs[1] = { m->input };
     if (!pose_check(LiteRtRunCompiledModel(m->compiled, 0, 1, inputs, POSE_MODEL_OUTPUTS, m->outputs))) return 0;
 
-    float *presence = NULL, *landmarks = NULL, *world = NULL;
+    float *presence, *landmarks, *world;
     if (!pose_check(LiteRtLockTensorBuffer(m->outputs[POSE_MODEL_OUT_PRESENCE], (void **)&presence, kLiteRtTensorBufferLockModeRead))) return 0;
     float present = presence[0];
     LiteRtUnlockTensorBuffer(m->outputs[POSE_MODEL_OUT_PRESENCE]);
