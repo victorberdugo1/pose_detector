@@ -20,6 +20,9 @@
 #define POSE_ARM_RATIO 0.332f
 #define POSE_LIMB_MARGIN 1.03f
 #define POSE_LIMB_MIN 0.8f
+#define POSE_IK_STRENGTH 0.35f
+#define POSE_BONE_TOLERANCE 0.12f
+#define POSE_BONE_FLOOR 0.85f
 #define POSE_BONE_KINDS 4
 #define POSE_FOLD_COS 0.94f
 #define POSE_ARM_TWIST 1.75f
@@ -475,7 +478,7 @@ static void pose_fit_spine(Pose *o, float length)
     float pelvis = (o->zModel[POSE_LHIP] + o->zModel[POSE_RHIP]) * 0.5f;
     float sign = o->zModel[POSE_NECK] >= pelvis ? 1.0f : -1.0f;
     float lean = sign * sqrtf(fmaxf(length * length - planar * planar, 0.0f));
-    float shift = pelvis + lean - o->zModel[POSE_NECK];
+    float shift = (pelvis + lean - o->zModel[POSE_NECK]) * POSE_IK_STRENGTH;
     for (size_t i = 0; i < sizeof PoseUpperBody / sizeof PoseUpperBody[0]; i++)
         o->zModel[PoseUpperBody[i]] += shift;
 }
@@ -571,10 +574,18 @@ static PoseVec pose_swing(PoseVec v, PoseVec from, PoseVec to, PoseVec half)
     return pose_add(pose_add(v, pose_mul(t, w)), pose_cross(axis, t));
 }
 
-static PoseVec pose_bone_end(PoseVec parent, PoseVec child, float length)
+static PoseVec pose_lerp(PoseVec a, PoseVec b, float t)
+{
+    return pose_add(a, pose_mul(pose_sub(b, a), t));
+}
+
+static PoseVec pose_bone_end(PoseVec parent, PoseVec child, float nominal)
 {
     float dx = child.x - parent.x, dy = child.y - parent.y;
     float planar = hypotf(dx, dy);
+    float reach = sqrtf(pose_dot(pose_sub(child, parent), pose_sub(child, parent)));
+    float length = pose_limit(reach, nominal * (1.0f - POSE_BONE_TOLERANCE), nominal * (1.0f + POSE_BONE_TOLERANCE));
+    if (length == reach) return child;
     if (planar >= length) {
         float s = length / planar;
         return (PoseVec){ parent.x + dx * s, parent.y + dy * s, parent.z };
@@ -601,8 +612,10 @@ static void pose_fit_limb(Pose *o, const PoseJoint chain[3], float upper, float 
     PoseVec bend = pose_add(pose_mul(nominal, cosf(angle)), pose_mul(lateral, sinf(angle)));
     float along = (d * d + upper * upper - lower * lower) / (2.0f * d);
     float off = sqrtf(fmaxf(upper * upper - along * along, 0.0f));
-    pose_place(o, chain[1], pose_add(root, pose_add(pose_mul(u, along), pose_mul(bend, off))));
-    pose_place(o, chain[2], pose_add(root, pose_mul(u, d)));
+    PoseVec solvedElbow = pose_add(root, pose_add(pose_mul(u, along), pose_mul(bend, off)));
+    PoseVec solvedWrist = pose_add(root, pose_mul(u, d));
+    pose_place(o, chain[1], pose_lerp(elbow, solvedElbow, POSE_IK_STRENGTH));
+    pose_place(o, chain[2], pose_lerp(wrist, solvedWrist, POSE_IK_STRENGTH));
 }
 
 static void pose_fit_bones(Pose *o, const PoseLimbs *limbs)
@@ -671,7 +684,7 @@ static PoseLimbs PoseMeasureLimbs(const Pose *poses, int count)
         for (int kind = 0; kind < POSE_BONE_KINDS; kind++) l.bone[kind] /= modeled;
     }
     for (int kind = 0; kind < POSE_BONE_KINDS; kind++)
-        l.bone[kind] = fmaxf(l.bone[kind], PoseBoneTorsoRatio[kind] * l.torso);
+        l.bone[kind] = fmaxf(l.bone[kind], POSE_BONE_FLOOR * PoseBoneTorsoRatio[kind] * l.torso);
     l.arm = fmaxf(l.arm * POSE_LIMB_MARGIN, POSE_LIMB_MIN * POSE_ARM_RATIO * tall);
     return l;
 }
