@@ -4,6 +4,8 @@
 #include "rlgl.h"
 #include "pose.h"
 #include "pose_model.h"
+#include "body_model.h"
+#include "pose_export.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
@@ -22,7 +24,11 @@
 #define EXPORT_EMPTY_FRAMES_DEFAULT 2
 #define EXPORT_EMPTY_FRAMES_MAX 10
 #define EXPORT_GAP_WIDTH 170.0f
+#define EXPORT_OVERFLOW 0.12f
 #define EXPORT_GAP_BUTTON 28.0f
+#define EXPORT_TOGGLE_WIDTH 116.0f
+#define EXPORT_TOGGLE_SPACING 6.0f
+#define EXPORT_TOGGLE_MARGIN 12.0f
 #define POSE_PICK_RADIUS 12.0f
 #define LIGHT_COUNT 3
 #define OPPOSITE_LIGHT_ANGLE 3.14159265f
@@ -33,7 +39,8 @@
 #define SIDE_ROTATE_SPEED 0.01f
 #define SIDE_RETURN_RATE 14.0f
 #define SIDE_YAW_EPSILON 0.01f
-#define SIDE_BACK_TINT (Color){ 45, 45, 55, 255 }
+#define SIDE_HALF_TURN 3.14159265f
+#define SIDE_BACK_TINT (Color){ 0, 0, 0, 255 }
 #define BODY_ALPHA 110
 #define BODY_UPPER_ARM_RADIUS 0.04f
 #define BODY_FOREARM_RADIUS 0.032f
@@ -73,6 +80,11 @@ static int dragJoint = -1;
 static bool dragSide = false;
 static bool sideRotating = false;
 static float sideYaw = 0.0f;
+
+static float SideAngle(void)
+{
+    return sideYaw + SIDE_HALF_TURN;
+}
 static bool scrubbing = false;
 static char spritePath[512] = "";
 
@@ -81,8 +93,19 @@ static bool showNormals = false;
 static bool autoLight = true;
 static bool playing = true;
 static bool poseMode = false;
-static int exportEmptyFrames = EXPORT_EMPTY_FRAMES_DEFAULT;
+static PoseExportOptions exportOptions = {
+    .ground = 1,
+    .aspect = 1,
+    .smooth = 2,
+    .keys = 0,
+    .emptyFrames = EXPORT_EMPTY_FRAMES_DEFAULT
+};
 static bool showDepth = false;
+static int exportPreview = 0;
+static int poseRevision = 0;
+static PoseExportResult exportResult = { 0 };
+static PoseExportOptions exportBuilt = { 0 };
+static int exportBuiltRevision = -1;
 
 static float lightStrength = 1.5f;
 static float lightSpeed = 1.0f;
@@ -103,6 +126,8 @@ static char statusText[256] =
 
 static PoseModel poseModel = { 0 };
 static bool poseModelReady = false;
+static BodyModel bodyModel = { 0 };
+static bool bodyModelReady = false;
 
 static const char *fragmentShader =
     "#version 330\n"
@@ -323,6 +348,21 @@ static void StepFrame(int direction)
     ShowFrame((frameIndex + direction + frameCount) % frameCount);
 }
 
+static bool ExportMarks(void)
+{
+    return poseMode && exportPreview && exportResult.count == frameCount;
+}
+
+static int TimelineStep(void)
+{
+    return ExportMarks() ? exportOptions.emptyFrames + 1 : 1;
+}
+
+static int TimelineSlots(void)
+{
+    return (frameCount - 1) * TimelineStep() + 1;
+}
+
 static void UpdateTimeline(void)
 {
     Rectangle bar = TimelineRect();
@@ -338,7 +378,8 @@ static void UpdateTimeline(void)
     if (!scrubbing)
         return;
 
-    int index = (int)((mouse.x - bar.x) / bar.width * frameCount);
+    int slots = TimelineSlots();
+    int index = (int)((mouse.x - bar.x) / bar.width * slots) / TimelineStep();
     index = index < 0 ? 0 : (index >= frameCount ? frameCount - 1 : index);
 
     if (index != frameIndex)
@@ -351,13 +392,25 @@ static void UpdateTimeline(void)
 static void DrawTimeline(void)
 {
     Rectangle bar = TimelineRect();
-    float cell = bar.width / frameCount;
+    int slots = TimelineSlots();
+    int step = TimelineStep();
+    float cell = bar.width / slots;
 
-    for (int i = 0; i < frameCount; i++)
+    for (int i = 0; i < slots; i++)
+    {
+        bool filled = i % step == 0;
+        int frame = i / step;
+        Color color = (Color){ 60, 70, 90, 255 };
+
+        if (ExportMarks())
+            color = !filled ? (Color){ 28, 32, 42, 255 }
+                : (exportResult.keep[frame] ? (Color){ 70, 160, 120, 255 } : (Color){ 42, 48, 62, 255 });
+
         DrawRectangleRec(
             (Rectangle){ bar.x + i * cell + Ui(1.0f), bar.y, cell - Ui(2.0f), bar.height },
-            i == frameIndex ? GOLD : (Color){ 60, 70, 90, 255 }
+            filled && frame == frameIndex ? GOLD : color
         );
+    }
 }
 
 static void RefreshPoseDepth(int index)
@@ -380,6 +433,8 @@ static void UnloadSprite(void)
     free(depthMaps);
     free(poses);
     free(frameFlips);
+    PoseExportFree(&exportResult);
+    poseRevision++;
     sprite = (Image){ 0 };
     normalFrames = NULL;
     depthMaps = NULL;
@@ -868,14 +923,15 @@ static Vector2 PoseToSide(Rectangle side, Rectangle view, float pivot, PosePoint
     float lateral = (p.x - pivot) * view.width / sprite.width;
 
     return (Vector2){
-        side.x + side.width * 0.5f + depth * cosf(sideYaw) + lateral * sinf(sideYaw),
+        side.x + side.width * 0.5f + depth * cosf(SideAngle()) + lateral * sinf(SideAngle()),
         PoseToScreen(view, p).y
     };
 }
 
-static const Color JointColors[POSE_JOINTS] = {
+static const Color JointColors[POSE_JOINTS + 1] = {
     [POSE_NOSE] = { 255, 215, 0, 255 },
     [POSE_NECK] = { 255, 150, 0, 255 },
+    [POSE_PELVIS] = { 255, 150, 0, 255 },
     [POSE_LEYE] = { 140, 220, 255, 255 },
     [POSE_LEAR] = { 0, 100, 200, 255 },
     [POSE_LSHOULDER] = { 0, 70, 255, 255 },
@@ -919,27 +975,89 @@ static void DrawBodyEllipse(Vector2 a, Vector2 b, float radius, Color color)
     rlPopMatrix();
 }
 
-static void DrawBodyVolume(const Pose *pose, const Vector2 *p, float scale)
+typedef struct {
+    Vector2 a, b;
+    float radius;
+    float depth;
+    Color color;
+} SideItem;
+
+#define SIDE_ITEM_MAX 64
+
+static float SideToward(Rectangle side, Rectangle view, float pivot, PosePoint p)
 {
-    const float armRadius[2] = { BODY_UPPER_ARM_RADIUS, BODY_FOREARM_RADIUS };
-    const float legRadius[2] = { BODY_THIGH_RADIUS, BODY_CALF_RADIUS };
+    float depth = -(p.z - 0.5f) * SideScale(side, view);
+    float lateral = (p.x - pivot) * view.width / sprite.width;
+
+    return lateral * cosf(SideAngle()) - depth * sinf(SideAngle());
+}
+
+static int CompareSideItems(const void *a, const void *b)
+{
+    float da = ((const SideItem *)a)->depth;
+    float db = ((const SideItem *)b)->depth;
+
+    return (da > db) - (da < db);
+}
+
+static int BuildSideItems(const Pose *pose, Rectangle side, Rectangle view, SideItem *items)
+{
+    float pivot = SidePivot(pose);
+    float scale = view.width / sprite.width;
+    Vector2 p[POSE_JOINTS + 1];
+    float toward[POSE_JOINTS + 1];
+    int n = 0;
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+    {
+        p[j] = PoseToSide(side, view, pivot, pose->p[j]);
+        toward[j] = SideToward(side, view, pivot, pose->p[j]);
+    }
+
+    p[POSE_PELVIS] = Vector2Scale(Vector2Add(p[POSE_LHIP], p[POSE_RHIP]), 0.5f);
+    toward[POSE_PELVIS] = (toward[POSE_LHIP] + toward[POSE_RHIP]) * 0.5f;
+
     float height = pose->height * scale;
     Vector2 pelvis = Vector2Scale(Vector2Add(p[POSE_LHIP], p[POSE_RHIP]), 0.5f);
+    float pelvisDepth = (toward[POSE_LHIP] + toward[POSE_RHIP]) * 0.5f;
     Vector2 head = { 0.0f, 0.0f };
+    float headDepth = 0.0f;
+    const int headCount = (int)(sizeof PoseHead / sizeof PoseHead[0]);
 
-    DrawBodyEllipse(p[POSE_NECK], pelvis, BODY_TORSO_RADIUS * height, JointColor(POSE_NECK));
+    for (int i = 0; i < headCount; i++)
+    {
+        head = Vector2Add(head, Vector2Scale(p[PoseHead[i]], 1.0f / headCount));
+        headDepth += toward[PoseHead[i]] / headCount;
+    }
+
+    const float armRadius[2] = { BODY_UPPER_ARM_RADIUS, BODY_FOREARM_RADIUS };
+    const float legRadius[2] = { BODY_THIGH_RADIUS, BODY_CALF_RADIUS };
+
+    items[n++] = (SideItem){ p[POSE_NECK], pelvis, BODY_TORSO_RADIUS * height, (toward[POSE_NECK] + pelvisDepth) * 0.5f, JointColor(POSE_NECK) };
 
     for (int k = 0; k < 2; k++)
         for (int s = 0; s < 2; s++)
         {
-            DrawBodyEllipse(p[PoseArms[k][s]], p[PoseArms[k][s + 1]], armRadius[s] * height, JointColor(PoseArms[k][s + 1]));
-            DrawBodyEllipse(p[PoseLegs[k][s]], p[PoseLegs[k][s + 1]], legRadius[s] * height, JointColor(PoseLegs[k][s + 1]));
+            int a = PoseArms[k][s], b = PoseArms[k][s + 1];
+            items[n++] = (SideItem){ p[a], p[b], armRadius[s] * height, (toward[a] + toward[b]) * 0.5f, JointColor(b) };
+            a = PoseLegs[k][s];
+            b = PoseLegs[k][s + 1];
+            items[n++] = (SideItem){ p[a], p[b], legRadius[s] * height, (toward[a] + toward[b]) * 0.5f, JointColor(b) };
         }
 
-    for (size_t i = 0; i < sizeof PoseHead / sizeof PoseHead[0]; i++)
-        head = Vector2Add(head, Vector2Scale(p[PoseHead[i]], 1.0f / (sizeof PoseHead / sizeof PoseHead[0])));
+    items[n++] = (SideItem){ head, head, POSE_HEAD_RADIUS * height, headDepth, JointColor(POSE_NOSE) };
 
-    DrawBodyEllipse(head, head, POSE_HEAD_RADIUS * height, JointColor(POSE_NOSE));
+    return n;
+}
+
+static void DrawSideItems(const SideItem *items, int count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        const SideItem *item = &items[i];
+
+        DrawBodyEllipse(item->a, item->b, item->radius, item->color);
+    }
 }
 
 static void ExportPoses(void)
@@ -951,7 +1069,7 @@ static void ExportPoses(void)
     );
 
     snprintf(statusText, sizeof(statusText),
-             PoseWriteJson(out, poses, frameCount, sprite.width, sprite.height, exportEmptyFrames)
+             PoseExportJson(out, poses, frameCount, sprite.width, sprite.height, &exportOptions)
                  ? "Exportado: %s" : "No se pudo escribir: %s",
              GetFileName(out));
 }
@@ -960,7 +1078,7 @@ static Rectangle ExportGapRect(void)
 {
     return (Rectangle){
         (float)GetScreenWidth() - Ui(24.0f) - Ui(EXPORT_GAP_WIDTH),
-        Ui(78.0f), Ui(EXPORT_GAP_WIDTH), Ui(EXPORT_GAP_BUTTON)
+        Ui(58.0f), Ui(EXPORT_GAP_WIDTH), Ui(EXPORT_GAP_BUTTON)
     };
 }
 
@@ -981,11 +1099,11 @@ static void UpdateExportGap(void)
 
     Vector2 mouse = GetMousePosition();
 
-    if (CheckCollisionPointRec(mouse, ExportGapButton(false)) && exportEmptyFrames > 0)
-        exportEmptyFrames--;
+    if (CheckCollisionPointRec(mouse, ExportGapButton(false)) && exportOptions.emptyFrames > 0)
+        exportOptions.emptyFrames--;
 
-    if (CheckCollisionPointRec(mouse, ExportGapButton(true)) && exportEmptyFrames < EXPORT_EMPTY_FRAMES_MAX)
-        exportEmptyFrames++;
+    if (CheckCollisionPointRec(mouse, ExportGapButton(true)) && exportOptions.emptyFrames < EXPORT_EMPTY_FRAMES_MAX)
+        exportOptions.emptyFrames++;
 }
 
 static void DrawExportGapButton(Rectangle rect, const char *text)
@@ -1007,19 +1125,87 @@ static void DrawExportGap(void)
 {
     Rectangle minus = ExportGapButton(false);
     Rectangle plus = ExportGapButton(true);
-    const char *label = TextFormat("Vacios: %d", exportEmptyFrames);
+    const char *label = TextFormat("Vacios: %d", exportOptions.emptyFrames);
     float left = minus.x + minus.width;
     float labelX = left + (plus.x - left - MeasureUiText(label, TEXT_BODY)) * 0.5f;
 
     DrawExportGapButton(minus, "-");
     DrawExportGapButton(plus, "+");
-    DrawUiText(label, labelX, Ui(82.0f), TEXT_BODY, RAYWHITE);
+    DrawUiText(label, labelX, minus.y + Ui(4.0f), TEXT_BODY, RAYWHITE);
+}
+
+typedef struct {
+    const char *name;
+    int *level;
+    int max;
+    int key;
+} ExportToggle;
+
+static const ExportToggle exportToggles[] = {
+    { "Suelo", &exportOptions.ground, 1, KEY_ONE },
+    { "Aspecto", &exportOptions.aspect, 1, KEY_TWO },
+    { "Suavizado", &exportOptions.smooth, POSE_EXPORT_LEVELS, KEY_THREE },
+    { "Keyframes", &exportOptions.keys, POSE_EXPORT_LEVELS, KEY_FOUR },
+    { "Resultado", &exportPreview, 1, KEY_FIVE }
+};
+
+#define EXPORT_TOGGLE_COUNT ((int)(sizeof exportToggles / sizeof exportToggles[0]))
+
+static Rectangle ExportToggleRect(int index)
+{
+    Rectangle gap = ExportGapRect();
+    int fromRight = EXPORT_TOGGLE_COUNT - index;
+
+    return (Rectangle){
+        gap.x - Ui(EXPORT_TOGGLE_MARGIN) - fromRight * Ui(EXPORT_TOGGLE_WIDTH) - (fromRight - 1) * Ui(EXPORT_TOGGLE_SPACING),
+        gap.y, Ui(EXPORT_TOGGLE_WIDTH), gap.height
+    };
+}
+
+static void UpdateExportToggles(void)
+{
+    Vector2 mouse = GetMousePosition();
+
+    for (int i = 0; i < EXPORT_TOGGLE_COUNT; i++)
+    {
+        const ExportToggle *toggle = &exportToggles[i];
+        bool clicked = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                       CheckCollisionPointRec(mouse, ExportToggleRect(i));
+
+        if (clicked || IsKeyPressed(toggle->key))
+            *toggle->level = (*toggle->level + 1) % (toggle->max + 1);
+    }
+}
+
+static void DrawExportToggles(void)
+{
+    for (int i = 0; i < EXPORT_TOGGLE_COUNT; i++)
+    {
+        const ExportToggle *toggle = &exportToggles[i];
+        Rectangle rect = ExportToggleRect(i);
+        int level = *toggle->level;
+        const char *label = level == 0
+            ? TextFormat("%s: no", toggle->name)
+            : (toggle->max > 1 ? TextFormat("%s: %d", toggle->name, level) : TextFormat("%s: si", toggle->name));
+
+        DrawRectangleRec(rect, CheckCollisionPointRec(GetMousePosition(), rect)
+            ? (Color){ 70, 80, 100, 255 }
+            : (Color){ 45, 52, 68, 255 });
+        DrawUiText(
+            label,
+            rect.x + (rect.width - MeasureUiText(label, TEXT_SMALL)) * 0.5f,
+            rect.y + Ui(6.0f),
+            TEXT_SMALL, level > 0 ? GOLD : LIGHTGRAY
+        );
+    }
 }
 
 static void RedetectPose(int index)
 {
     Pose *pose = &poses[index];
     PoseLimbs frameLimbs = limbs;
+
+    poseRevision++;
 
     frameLimbs.flips = frameFlips[index];
     DetectPose(
@@ -1032,6 +1218,8 @@ static void RedetectPose(int index)
 
 static void ReloadPoses(void)
 {
+    poseRevision++;
+
     if (!poses[frameIndex].valid)
     {
         snprintf(statusText, sizeof(statusText),
@@ -1044,7 +1232,7 @@ static void ReloadPoses(void)
 
     for (int i = frameIndex + 1; i < frameCount; i++)
     {
-        frameFlips[i] = (PoseFlips){ { 0 }, 0 };
+        frameFlips[i] = (PoseFlips){ 0 };
         RedetectPose(i);
         frameFlips[i] = PoseLearnFlips(&poses[i - 1], &poses[i]);
         RedetectPose(i);
@@ -1056,6 +1244,8 @@ static void ReloadPoses(void)
 
 static void MoveJoints(Pose *pose, int joint, float dx, float dy, float dz, float range)
 {
+    poseRevision++;
+
     bool head = joint == POSE_NOSE;
     int count = head ? (int)(sizeof PoseHead / sizeof PoseHead[0]) : 1;
 
@@ -1093,7 +1283,7 @@ static void UpdatePoseEditor(void)
 
     Rectangle side = SidePanelRect();
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid)
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid && !exportPreview)
     {
         float best = Ui(POSE_PICK_RADIUS);
 
@@ -1133,14 +1323,14 @@ static void UpdatePoseEditor(void)
     }
 
     if (sideRotating)
-        sideYaw += GetMouseDelta().x * SIDE_ROTATE_SPEED;
+        sideYaw -= GetMouseDelta().x * SIDE_ROTATE_SPEED;
     else
         sideYaw *= expf(-SIDE_RETURN_RATE * GetFrameTime());
 
     if (dragJoint >= 0 && dragSide)
     {
         float range = SideZRange(side, view);
-        float z = 0.5f - (mouse.x - side.x - side.width * 0.5f) / SideScale(side, view);
+        float z = 0.5f + (mouse.x - side.x - side.width * 0.5f) / SideScale(side, view);
 
         MoveJoints(pose, dragJoint, 0.0f, 0.0f, Clamp(z, 0.5f - range, 0.5f + range) - pose->p[dragJoint].z, range);
     }
@@ -1158,7 +1348,7 @@ static void UpdatePoseEditor(void)
 static void DrawSideBillboard(Rectangle side, Rectangle view, float pivot, Rectangle source)
 {
     float scale = view.width / sprite.width;
-    float shear = sinf(sideYaw);
+    float shear = sinf(SideAngle());
     float left = side.x + side.width * 0.5f - pivot * scale * shear;
     float right = left + view.width * shear;
     Rectangle dest = { fminf(left, right), view.y, fabsf(right - left), view.height };
@@ -1179,6 +1369,166 @@ static void DrawSideBillboard(Rectangle side, Rectangle view, float pivot, Recta
     EndScissorMode();
 }
 
+static void RefreshExportPreview(void)
+{
+    if (exportBuiltRevision == poseRevision && !memcmp(&exportBuilt, &exportOptions, sizeof exportBuilt))
+        return;
+
+    PoseExportBuild(&exportResult, poses, frameCount, sprite.width, sprite.height, &exportOptions);
+    exportBuilt = exportOptions;
+    exportBuiltRevision = poseRevision;
+}
+
+static float ExportScaleX(Rectangle view)
+{
+    return exportBuilt.aspect ? view.height : view.width;
+}
+
+static Vector2 ExportToStage(Rectangle view, const float *p)
+{
+    return (Vector2){ view.x + view.width * 0.5f + (p[0] - 0.5f) * ExportScaleX(view), view.y + p[1] * view.height };
+}
+
+static Vector2 ExportToSide(Rectangle side, Rectangle view, float pivot, const float *p)
+{
+    float depth = -(p[2] - 0.5f) * SideScale(side, view);
+    float lateral = (p[0] - pivot) * ExportScaleX(view);
+
+    return (Vector2){
+        side.x + side.width * 0.5f + depth * cosf(SideAngle()) + lateral * sinf(SideAngle()),
+        view.y + p[1] * view.height
+    };
+}
+
+static float ExportSideToward(Rectangle side, Rectangle view, float pivot, const float *p)
+{
+    float depth = -(p[2] - 0.5f) * SideScale(side, view);
+    float lateral = (p[0] - pivot) * ExportScaleX(view);
+
+    return lateral * cosf(SideAngle()) - depth * sinf(SideAngle());
+}
+
+static void FillPelvis3D(Vector3 *k)
+{
+    k[POSE_PELVIS] = Vector3Scale(Vector3Add(k[POSE_LHIP], k[POSE_RHIP]), 0.5f);
+}
+
+static void DrawBones3D(const Vector3 *k, Rectangle clip, float boneRadius, float jointRadius, int highlight, bool withBody)
+{
+    bool drawBody = withBody && bodyModelReady;
+
+    if (drawBody)
+        body_pose(&bodyModel, k);
+
+    BeginScissorMode((int)clip.x, (int)clip.y, (int)clip.width, (int)clip.height);
+    BeginMode3D(BodyCamera());
+
+    if (drawBody)
+        DrawMesh(bodyModel.mesh, bodyModel.material, MatrixIdentity());
+
+    for (int i = 0; i < POSE_BONE_COUNT; i++)
+        DrawCylinderEx(k[PoseBones[i][0]], k[PoseBones[i][1]], boneRadius, boneRadius, 8, BoneColor(i));
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+        DrawSphere(k[j], j == highlight ? jointRadius * 1.4f : jointRadius, JointColor(j));
+
+    EndMode3D();
+    EndScissorMode();
+}
+
+static void DrawExportGhost(const Vector2 *joints)
+{
+    const Color ghostColor = { 150, 155, 170, 120 };
+    Vector2 p[POSE_JOINTS + 1];
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+        p[j] = joints[j];
+    p[POSE_PELVIS] = Vector2Scale(Vector2Add(p[POSE_LHIP], p[POSE_RHIP]), 0.5f);
+
+    for (int i = 0; i < POSE_BONE_COUNT; i++)
+        DrawLineEx(p[PoseBones[i][0]], p[PoseBones[i][1]], Ui(1.5f), ghostColor);
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+        DrawCircleV(p[j], Ui(3.0f), ghostColor);
+}
+
+static void DrawExportPreview(Rectangle view, Rectangle side)
+{
+    RefreshExportPreview();
+
+    float floorY = view.y + view.height;
+    float centerX = view.x + view.width * 0.5f;
+    int sent = 0;
+
+    for (int i = 0; i < frameCount; i++)
+        sent += exportResult.count == frameCount && exportResult.keep[i];
+
+    DrawRectangleRec(view, (Color){ 22, 26, 36, 255 });
+    DrawRectangleLinesEx(view, Ui(1.0f), (Color){ 70, 80, 100, 255 });
+    DrawLine((int)centerX, (int)view.y, (int)centerX, (int)floorY, (Color){ 52, 58, 74, 255 });
+    DrawLineEx((Vector2){ view.x, floorY }, (Vector2){ view.x + view.width, floorY }, Ui(2.0f), (Color){ 70, 160, 120, 255 });
+    DrawUiText("suelo", view.x + Ui(8.0f), floorY - Ui(20.0f), TEXT_SMALL, (Color){ 70, 160, 120, 255 });
+
+    DrawUiText(
+        TextFormat("Resultado de exportacion | %d de %d frames | %d con vacios", sent, frameCount, TimelineSlots()),
+        view.x + Ui(10.0f), view.y + Ui(8.0f), TEXT_BODY, RAYWHITE
+    );
+    DrawUiText("gris: deteccion | color: exportado", view.x + Ui(10.0f), view.y + Ui(30.0f), TEXT_SMALL, GRAY);
+
+    int k = PoseExportFind(&exportResult, frameIndex);
+    float shown[POSE_JOINTS][3];
+
+    if (!PoseExportSample(&exportResult, frameIndex, shown))
+    {
+        DrawUiText("Sin pose para este frame", view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, GOLD);
+        return;
+    }
+
+    DrawUiText(
+        exportResult.keep[frameIndex]
+            ? TextFormat("frame_%04d | exportado", frameIndex * (exportOptions.emptyFrames + 1))
+            : "interpolado entre keyframes",
+        view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, exportResult.keep[frameIndex] ? GOLD : SKYBLUE
+    );
+
+    Vector2 rawFront[POSE_JOINTS], rawLateral[POSE_JOINTS];
+    float pivot = (shown[POSE_LHIP][0] + shown[POSE_RHIP][0]) * 0.5f;
+    Vector3 frontK[POSE_JOINTS + 1], sideK[POSE_JOINTS + 1];
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+    {
+        Vector2 front = ExportToStage(view, shown[j]);
+        Vector2 lateral = ExportToSide(side, view, pivot, shown[j]);
+
+        frontK[j] = (Vector3){ front.x, -front.y, (shown[j][2] - 0.5f) * view.height };
+        sideK[j] = (Vector3){ lateral.x, -lateral.y, ExportSideToward(side, view, pivot, shown[j]) };
+    }
+
+    FillPelvis3D(frontK);
+    FillPelvis3D(sideK);
+    float margin = fminf(view.height * EXPORT_OVERFLOW, fminf(fminf(view.x, side.x), fminf(view.y, side.y)));
+    Rectangle frontClip = { view.x - margin, view.y - margin, view.width + 2.0f * margin, view.height + margin };
+    Rectangle sideClip = { side.x - margin, side.y - margin, side.width + 2.0f * margin, side.height + margin };
+
+    DrawBones3D(frontK, frontClip, Ui(2.5f), Ui(5.0f), -1, true);
+    DrawBones3D(sideK, sideClip, Ui(2.5f), Ui(5.0f), -1, true);
+
+    if (k >= 0)
+    {
+        const PoseExportFrame *raw = &exportResult.raw[k];
+        float rawPivot = (raw->p[POSE_LHIP][0] + raw->p[POSE_RHIP][0]) * 0.5f;
+
+        for (int j = 0; j < POSE_JOINTS; j++)
+        {
+            rawFront[j] = ExportToStage(view, raw->p[j]);
+            rawLateral[j] = ExportToSide(side, view, rawPivot, raw->p[j]);
+        }
+
+        DrawExportGhost(rawLateral);
+        DrawExportGhost(rawFront);
+    }
+}
+
 static void DrawPoseView(void)
 {
     Rectangle view = PoseViewRect();
@@ -1189,11 +1539,13 @@ static void DrawPoseView(void)
     };
 
     DrawRectangleRec(view, (Color){ 30, 34, 46, 255 });
-    DrawTexturePro(
-        showDepth ? depthTexture : originalTexture,
-        showDepth ? (Rectangle){ 0.0f, 0.0f, (float)depthTexture.width, (float)depthTexture.height } : source,
-        view, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE
-    );
+
+    if (!exportPreview)
+        DrawTexturePro(
+            showDepth ? depthTexture : originalTexture,
+            showDepth ? (Rectangle){ 0.0f, 0.0f, (float)depthTexture.width, (float)depthTexture.height } : source,
+            view, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE
+        );
 
     Rectangle side = SidePanelRect();
     float sideCenter = side.x + side.width * 0.5f;
@@ -1212,6 +1564,12 @@ static void DrawPoseView(void)
     DrawUiText("lejos", side.x + Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
     DrawUiTextRight("cerca", side.x + side.width - Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
 
+    if (exportPreview)
+    {
+        DrawExportPreview(view, side);
+        return;
+    }
+
     const Pose *pose = &poses[frameIndex];
 
     if (!pose->valid)
@@ -1219,21 +1577,24 @@ static void DrawPoseView(void)
 
     DrawSideBillboard(side, view, SidePivot(pose), source);
 
-    Vector2 sidePoint[POSE_JOINTS];
+    SideItem sideItems[SIDE_ITEM_MAX];
+    int sideCount = BuildSideItems(pose, side, view, sideItems);
 
-    for (int j = 0; j < POSE_JOINTS; j++)
-        sidePoint[j] = PoseToSide(side, view, SidePivot(pose), pose->p[j]);
+    qsort(sideItems, sideCount, sizeof *sideItems, CompareSideItems);
+    DrawSideItems(sideItems, sideCount);
 
-    DrawBodyVolume(pose, sidePoint, view.width / sprite.width);
-
-    for (int i = 0; i < POSE_BONE_COUNT; i++)
-        DrawLineEx(sidePoint[PoseBones[i][0]], sidePoint[PoseBones[i][1]], Ui(3.0f), BoneColor(i));
+    Vector3 sideK[POSE_JOINTS + 1];
+    float sidePivot = SidePivot(pose);
 
     for (int j = 0; j < POSE_JOINTS; j++)
     {
-        DrawCircleV(sidePoint[j], Ui(j == dragJoint && dragSide ? 9.0f : 7.0f), JointColor(j));
-        DrawCircleLinesV(sidePoint[j], Ui(7.0f), BLACK);
+        Vector2 lateral = PoseToSide(side, view, sidePivot, pose->p[j]);
+
+        sideK[j] = (Vector3){ lateral.x, -lateral.y, SideToward(side, view, sidePivot, pose->p[j]) };
     }
+
+    FillPelvis3D(sideK);
+    DrawBones3D(sideK, side, Ui(3.0f), Ui(7.0f), dragSide ? dragJoint : -1, false);
 
     if (dragJoint >= 0)
         DrawUiText(
@@ -1241,20 +1602,17 @@ static void DrawPoseView(void)
             side.x + Ui(10.0f), side.y + side.height - Ui(28.0f), TEXT_BODY, RAYWHITE
         );
 
-    for (int i = 0; i < POSE_BONE_COUNT; i++)
-        DrawLineEx(
-            PoseToScreen(view, pose->p[PoseBones[i][0]]),
-            PoseToScreen(view, pose->p[PoseBones[i][1]]),
-            Ui(2.0f), BoneColor(i)
-        );
+    Vector3 frontK[POSE_JOINTS + 1];
 
     for (int j = 0; j < POSE_JOINTS; j++)
     {
-        Vector2 p = PoseToScreen(view, pose->p[j]);
+        Vector2 screen = PoseToScreen(view, pose->p[j]);
 
-        DrawCircleV(p, Ui(j == dragJoint ? 7.0f : 5.0f), JointColor(j));
-        DrawCircleLinesV(p, Ui(5.0f), BLACK);
+        frontK[j] = (Vector3){ screen.x, -screen.y, (pose->p[j].z - 0.5f) * view.height };
     }
+
+    FillPelvis3D(frontK);
+    DrawBones3D(frontK, view, Ui(2.0f), Ui(5.0f), dragJoint, false);
 }
 
 static bool LoadImageFromPathText(const char *text)
@@ -1336,6 +1694,14 @@ int main(int argc, char **argv)
 
     if (!poseModelReady)
         snprintf(statusText, sizeof(statusText), "Modelo de pose no encontrado: usando heuristica");
+
+    bodyModelReady = BodyModelOpen(
+        &bodyModel,
+        TextFormat("%s" BODY_MODEL_FILE, GetApplicationDirectory())
+    );
+
+    if (!bodyModelReady)
+        snprintf(statusText, sizeof(statusText), "Modelo del cuerpo no encontrado: " BODY_MODEL_FILE);
 
     int locLight1 = GetShaderLocation(lightShader, "lightLocal1");
     int locLight2 = GetShaderLocation(lightShader, "lightLocal2");
@@ -1430,6 +1796,7 @@ int main(int argc, char **argv)
         if (poseMode && hasImage)
         {
             UpdateExportGap();
+            UpdateExportToggles();
             UpdatePoseEditor();
         }
 
@@ -1571,7 +1938,10 @@ int main(int argc, char **argv)
         DrawUiText(statusText, Ui(24.0f), Ui(80.0f), TEXT_SMALL, GRAY);
 
         if (poseMode)
+        {
             DrawExportGap();
+            DrawExportToggles();
+        }
 
         if (hasImage && frameCount > 1)
             DrawTimeline();
@@ -1601,7 +1971,7 @@ int main(int argc, char **argv)
 
         DrawUiText(
             poseMode
-                ? "Clic izquierdo + arrastrar: mover articulacion | R: redetectar | J: exportar JSON | Z: depth map"
+                ? "Clic izquierdo + arrastrar: mover articulacion | R: redetectar | J: exportar JSON | 1-4: opciones | 5: ver resultado | Z: depth map"
                 : "Clic izquierdo + arrastrar: mover las tres luces",
             Ui(20.0f), screenH - Ui(59.0f), TEXT_BODY, LIGHTGRAY
         );
@@ -1633,7 +2003,11 @@ int main(int argc, char **argv)
     if (UiFontIsCustom())
         UnloadFont(uiFont);
 
+    if (bodyModelReady)
+        BodyModelClose(&bodyModel);
+
     UnloadShader(lightShader);
+
     PoseModelClose(&poseModel);
     CloseWindow();
 

@@ -255,9 +255,19 @@ static int PoseModelDetect(PoseModel *m, const uint8_t *rgba, int w, int h, Pose
     LiteRtUnlockTensorBuffer(m->outputs[POSE_MODEL_OUT_LANDMARKS]);
     if (pixelsPerMeter <= 0.0f) return 0;
 
-    pose.p[POSE_NECK].x = (pose.p[POSE_LSHOULDER].x + pose.p[POSE_RSHOULDER].x) * 0.5f;
-    pose.p[POSE_NECK].y = (pose.p[POSE_LSHOULDER].y + pose.p[POSE_RSHOULDER].y) * 0.5f;
-    pose.zModel[POSE_NECK] = (pose.zModel[POSE_LSHOULDER] + pose.zModel[POSE_RSHOULDER]) * 0.5f;
+    PosePoint shoulderMid = {
+        (pose.p[POSE_LSHOULDER].x + pose.p[POSE_RSHOULDER].x) * 0.5f,
+        (pose.p[POSE_LSHOULDER].y + pose.p[POSE_RSHOULDER].y) * 0.5f, 0.0f, 0.0f
+    };
+    PosePoint earMid = {
+        (pose.p[POSE_LEAR].x + pose.p[POSE_REAR].x) * 0.5f,
+        (pose.p[POSE_LEAR].y + pose.p[POSE_REAR].y) * 0.5f, 0.0f, 0.0f
+    };
+    float shoulderZ = (pose.zModel[POSE_LSHOULDER] + pose.zModel[POSE_RSHOULDER]) * 0.5f;
+    float earZ = (pose.zModel[POSE_LEAR] + pose.zModel[POSE_REAR]) * 0.5f;
+    pose.p[POSE_NECK].x = shoulderMid.x + (earMid.x - shoulderMid.x) * POSE_NECK_RATIO;
+    pose.p[POSE_NECK].y = shoulderMid.y + (earMid.y - shoulderMid.y) * POSE_NECK_RATIO;
+    pose.zModel[POSE_NECK] = shoulderZ + (earZ - shoulderZ) * POSE_NECK_RATIO;
     float pelvis = (pose.p[POSE_LHIP].x + pose.p[POSE_RHIP].x) * 0.5f;
     pose.yaw = pose_limit((pose.p[POSE_NOSE].x - pelvis) / (POSE_YAW_RANGE * bh), -1.0f, 1.0f);
     pose.height = bh;

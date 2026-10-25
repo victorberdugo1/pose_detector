@@ -21,9 +21,12 @@
 #define POSE_LIMB_MARGIN 1.03f
 #define POSE_LIMB_MIN 0.8f
 #define POSE_BONE_KINDS 4
-#define POSE_CHAINS 4
+#define POSE_FOLD_COS 0.94f
+#define POSE_ARM_TWIST 1.75f
+#define POSE_LEG_TWIST 1.05f
 #define POSE_FLIP_MIN 0.01f
 #define POSE_HEAD_REACH 0.3f
+#define POSE_NECK_RATIO 0.4f
 #define POSE_BG_TOLERANCE 16
 
 typedef enum {
@@ -48,9 +51,16 @@ typedef struct {
 } Pose;
 
 typedef struct {
-    int chain[POSE_CHAINS];
     int head;
 } PoseFlips;
+
+typedef struct {
+    float x, y, z;
+} PoseVec;
+
+typedef struct {
+    PoseVec forward, down, side;
+} PoseBody;
 
 typedef struct {
     float arm;
@@ -74,18 +84,20 @@ typedef struct {
 } PoseBand;
 
 static const char *const PoseNames[POSE_JOINTS] = {
-    "Nose", "LEye", "REye", "LEar", "REar", "LShoulder", "RShoulder",
-    "LElbow", "RElbow", "LWrist", "RWrist", "LHip", "RHip",
-    "LKnee", "RKnee", "LAnkle", "RAnkle", "Neck"
+    "Nose", "REye", "LEye", "REar", "LEar", "RShoulder", "LShoulder",
+    "RElbow", "LElbow", "RWrist", "LWrist", "RHip", "LHip",
+    "RKnee", "LKnee", "RAnkle", "LAnkle", "Neck"
 };
+
+#define POSE_PELVIS POSE_JOINTS
 
 static const int PoseBones[][2] = {
     {POSE_NECK, POSE_NOSE}, {POSE_NOSE, POSE_LEYE}, {POSE_LEYE, POSE_LEAR},
     {POSE_NOSE, POSE_REYE}, {POSE_REYE, POSE_REAR},
     {POSE_NECK, POSE_LSHOULDER}, {POSE_LSHOULDER, POSE_LELBOW}, {POSE_LELBOW, POSE_LWRIST},
     {POSE_NECK, POSE_RSHOULDER}, {POSE_RSHOULDER, POSE_RELBOW}, {POSE_RELBOW, POSE_RWRIST},
-    {POSE_NECK, POSE_LHIP}, {POSE_LHIP, POSE_LKNEE}, {POSE_LKNEE, POSE_LANKLE},
-    {POSE_NECK, POSE_RHIP}, {POSE_RHIP, POSE_RKNEE}, {POSE_RKNEE, POSE_RANKLE}
+    {POSE_NECK, POSE_PELVIS}, {POSE_PELVIS, POSE_LHIP}, {POSE_LHIP, POSE_LKNEE}, {POSE_LKNEE, POSE_LANKLE},
+    {POSE_PELVIS, POSE_RHIP}, {POSE_RHIP, POSE_RKNEE}, {POSE_RKNEE, POSE_RANKLE}
 };
 
 #define POSE_BONE_COUNT ((int)(sizeof(PoseBones) / sizeof(PoseBones[0])))
@@ -105,10 +117,6 @@ static const PoseJoint PoseBoneChain[POSE_BONE_KINDS][2][2] = {
 static const PoseJoint PoseLegs[2][3] = {
     {POSE_LHIP, POSE_LKNEE, POSE_LANKLE},
     {POSE_RHIP, POSE_RKNEE, POSE_RANKLE}
-};
-
-static const PoseJoint *const PoseChains[POSE_CHAINS] = {
-    PoseArms[0], PoseArms[1], PoseLegs[0], PoseLegs[1]
 };
 
 static int pose_on(const uint8_t *rgba, int w, int x, int y)
@@ -444,23 +452,6 @@ static void pose_solve_arm(Pose *o, const PoseJoint chain[3], float length)
     o->p[chain[1]].y = root.y + uy * along + py * off;
 }
 
-static void pose_fit_segment(Pose *o, PoseJoint parent, PoseJoint child, float length)
-{
-    PosePoint *a = &o->p[parent], *b = &o->p[child];
-    float dx = b->x - a->x, dy = b->y - a->y;
-    float planar = hypotf(dx, dy);
-    if (length <= 0.0f || planar < 0.001f) return;
-    if (planar >= length) {
-        float s = length / planar;
-        b->x = a->x + dx * s;
-        b->y = a->y + dy * s;
-        o->zModel[child] = o->zModel[parent];
-        return;
-    }
-    float sign = o->zModel[child] >= o->zModel[parent] ? 1.0f : -1.0f;
-    o->zModel[child] = o->zModel[parent] + sign * sqrtf(length * length - planar * planar);
-}
-
 static float pose_torso(const Pose *p)
 {
     PosePoint pelvis = { (p->p[POSE_LHIP].x + p->p[POSE_RHIP].x) * 0.5f, (p->p[POSE_LHIP].y + p->p[POSE_RHIP].y) * 0.5f, 0.0f, 0.0f };
@@ -507,22 +498,111 @@ static void pose_face_away(Pose *o)
         o->zModel[j] = 2.0f * pelvis - o->zModel[j];
 }
 
-static void pose_hinge(Pose *o, const PoseJoint chain[3], float ratio, float bend)
+static PoseVec pose_add(PoseVec a, PoseVec b)
 {
-    float root = o->zModel[chain[0]];
-    float chord = root + ratio * (o->zModel[chain[2]] - root);
-    float *mid = &o->zModel[chain[1]];
-    if (bend * (*mid - chord) < 0.0f) *mid = 2.0f * root - *mid;
+    return (PoseVec){ a.x + b.x, a.y + b.y, a.z + b.z };
 }
 
-static void pose_bend_limbs(Pose *o, const PoseLimbs *limbs)
+static PoseVec pose_sub(PoseVec a, PoseVec b)
 {
-    float armRatio = limbs->bone[0] / fmaxf(limbs->bone[0] + limbs->bone[1], 0.001f);
-    float legRatio = limbs->bone[2] / fmaxf(limbs->bone[2] + limbs->bone[3], 0.001f);
-    for (int k = 0; k < 2; k++) {
-        pose_hinge(o, PoseArms[k], armRatio, -1.0f);
-        pose_hinge(o, PoseLegs[k], legRatio, 1.0f);
+    return (PoseVec){ a.x - b.x, a.y - b.y, a.z - b.z };
+}
+
+static PoseVec pose_mul(PoseVec a, float s)
+{
+    return (PoseVec){ a.x * s, a.y * s, a.z * s };
+}
+
+static float pose_dot(PoseVec a, PoseVec b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static PoseVec pose_cross(PoseVec a, PoseVec b)
+{
+    return (PoseVec){ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+
+static PoseVec pose_unit(PoseVec v, PoseVec fallback)
+{
+    float n = sqrtf(pose_dot(v, v));
+    return n > 0.001f ? pose_mul(v, 1.0f / n) : fallback;
+}
+
+static PoseVec pose_joint(const Pose *o, PoseJoint j)
+{
+    return (PoseVec){ o->p[j].x, o->p[j].y, o->zModel[j] };
+}
+
+static PoseVec pose_mid(const Pose *o, PoseJoint a, PoseJoint b)
+{
+    return pose_mul(pose_add(pose_joint(o, a), pose_joint(o, b)), 0.5f);
+}
+
+static void pose_place(Pose *o, PoseJoint j, PoseVec v)
+{
+    o->p[j].x = v.x;
+    o->p[j].y = v.y;
+    o->zModel[j] = v.z;
+}
+
+static PoseBody pose_body(const Pose *o)
+{
+    PoseVec down = pose_unit(pose_sub(pose_mid(o, POSE_LHIP, POSE_RHIP), pose_joint(o, POSE_NECK)), (PoseVec){ 0.0f, 1.0f, 0.0f });
+    PoseVec across = pose_sub(pose_joint(o, POSE_LSHOULDER), pose_joint(o, POSE_RSHOULDER));
+    PoseVec forward = pose_unit(pose_cross(across, down), (PoseVec){ 0.0f, 0.0f, 1.0f });
+    PoseVec gaze = pose_sub(pose_joint(o, POSE_NOSE), pose_mid(o, POSE_LEAR, POSE_REAR));
+    if (pose_dot(forward, gaze) < 0.0f) forward = pose_mul(forward, -1.0f);
+    return (PoseBody){ forward, down, pose_unit(pose_cross(forward, down), (PoseVec){ 1.0f, 0.0f, 0.0f }) };
+}
+
+static PoseVec pose_swing(PoseVec v, PoseVec from, PoseVec to, PoseVec half)
+{
+    PoseVec axis = pose_cross(from, to);
+    float w = 1.0f + pose_dot(from, to);
+    if (w < 0.0001f) {
+        axis = half;
+        w = 0.0f;
     }
+    float n = sqrtf(w * w + pose_dot(axis, axis));
+    axis = pose_mul(axis, 1.0f / n);
+    w /= n;
+    PoseVec t = pose_mul(pose_cross(axis, v), 2.0f);
+    return pose_add(pose_add(v, pose_mul(t, w)), pose_cross(axis, t));
+}
+
+static PoseVec pose_bone_end(PoseVec parent, PoseVec child, float length)
+{
+    float dx = child.x - parent.x, dy = child.y - parent.y;
+    float planar = hypotf(dx, dy);
+    if (planar >= length) {
+        float s = length / planar;
+        return (PoseVec){ parent.x + dx * s, parent.y + dy * s, parent.z };
+    }
+    float sign = child.z >= parent.z ? 1.0f : -1.0f;
+    return (PoseVec){ child.x, child.y, parent.z + sign * sqrtf(length * length - planar * planar) };
+}
+
+static void pose_fit_limb(Pose *o, const PoseJoint chain[3], float upper, float lower, const PoseBody *body, float flexion, float twist)
+{
+    if (upper <= 0.0f || lower <= 0.0f) return;
+    PoseVec root = pose_joint(o, chain[0]);
+    PoseVec elbow = pose_bone_end(root, pose_joint(o, chain[1]), upper);
+    PoseVec wrist = pose_bone_end(elbow, pose_joint(o, chain[2]), lower);
+    PoseVec reach = pose_sub(wrist, root);
+    float fold = sqrtf(upper * upper + lower * lower - 2.0f * upper * lower * POSE_FOLD_COS);
+    float d = pose_limit(sqrtf(pose_dot(reach, reach)), fold, upper + lower);
+    PoseVec u = pose_unit(reach, body->down);
+    PoseVec nominal = pose_swing(pose_mul(body->forward, flexion), body->down, u, body->side);
+    PoseVec lateral = pose_cross(u, nominal);
+    PoseVec seen = pose_sub(elbow, root);
+    float sx = pose_dot(seen, nominal), sy = pose_dot(seen, lateral);
+    float angle = sx * sx + sy * sy > 0.000001f ? pose_limit(atan2f(sy, sx), -twist, twist) : 0.0f;
+    PoseVec bend = pose_add(pose_mul(nominal, cosf(angle)), pose_mul(lateral, sinf(angle)));
+    float along = (d * d + upper * upper - lower * lower) / (2.0f * d);
+    float off = sqrtf(fmaxf(upper * upper - along * along, 0.0f));
+    pose_place(o, chain[1], pose_add(root, pose_add(pose_mul(u, along), pose_mul(bend, off))));
+    pose_place(o, chain[2], pose_add(root, pose_mul(u, d)));
 }
 
 static void pose_fit_bones(Pose *o, const PoseLimbs *limbs)
@@ -530,22 +610,14 @@ static void pose_fit_bones(Pose *o, const PoseLimbs *limbs)
     pose_face_away(o);
     pose_fit_spine(o, limbs->torso);
     pose_fit_head(o, limbs->torso);
-    for (int kind = 0; kind < POSE_BONE_KINDS; kind += 2)
-        for (int k = 0; k < 2; k++)
-            pose_fit_segment(o, PoseBoneChain[kind][k][0], PoseBoneChain[kind][k][1], limbs->bone[kind]);
-    pose_bend_limbs(o, limbs);
-    for (int kind = 1; kind < POSE_BONE_KINDS; kind += 2)
-        for (int k = 0; k < 2; k++)
-            pose_fit_segment(o, PoseBoneChain[kind][k][0], PoseBoneChain[kind][k][1], limbs->bone[kind]);
+    PoseBody body = pose_body(o);
+    for (int k = 0; k < 2; k++) {
+        pose_fit_limb(o, PoseArms[k], limbs->bone[0], limbs->bone[1], &body, -1.0f, POSE_ARM_TWIST);
+        pose_fit_limb(o, PoseLegs[k], limbs->bone[2], limbs->bone[3], &body, 1.0f, POSE_LEG_TWIST);
+    }
     if (limbs->flips.head)
         for (size_t i = 0; i < sizeof PoseHead / sizeof PoseHead[0]; i++)
             o->zModel[PoseHead[i]] = 2.0f * o->zModel[POSE_NECK] - o->zModel[PoseHead[i]];
-    for (int i = 0; i < POSE_CHAINS; i++) {
-        if (!limbs->flips.chain[i]) continue;
-        const PoseJoint *c = PoseChains[i];
-        o->zModel[c[1]] = 2.0f * o->zModel[c[0]] - o->zModel[c[1]];
-        pose_fit_segment(o, c[1], c[2], limbs->bone[i / 2 * 2 + 1]);
-    }
 }
 
 static void PoseFitLimbs(Pose *o, const PoseLimbs *limbs)
@@ -569,14 +641,8 @@ static void PoseAdoptDepth(Pose *pose, int imageHeight)
 
 static PoseFlips PoseLearnFlips(const Pose *edited, const Pose *fresh)
 {
-    PoseFlips toggled = { { 0 }, 0 };
+    PoseFlips toggled = { 0 };
     if (!edited->valid || !fresh->valid || !fresh->hasZModel) return toggled;
-    for (int i = 0; i < POSE_CHAINS; i++) {
-        const PoseJoint *c = PoseChains[i];
-        float before = fresh->p[c[1]].z - fresh->p[c[0]].z;
-        float after = edited->p[c[1]].z - edited->p[c[0]].z;
-        toggled.chain[i] = before * after < 0.0f && fabsf(after) > POSE_FLIP_MIN;
-    }
     float headBefore = fresh->p[POSE_NOSE].z - fresh->p[POSE_NECK].z;
     float headAfter = edited->p[POSE_NOSE].z - edited->p[POSE_NECK].z;
     toggled.head = headBefore * headAfter < 0.0f && fabsf(headAfter) > POSE_FLIP_MIN;
@@ -729,27 +795,6 @@ static void PoseDepthImage(const float *depth, const uint8_t *rgba, int w, int h
             p[0] = p[1] = p[2] = g;
             p[3] = solid ? 255 : 0;
         }
-}
-
-static int PoseWriteJson(const char *path, const Pose *poses, int count, int w, int h, int gap)
-{
-    FILE *f = fopen(path, "w");
-    if (!f) return 0;
-    fputs("{\n", f);
-    int first = 1;
-    int inserted = 0;
-    for (int i = 0; i < count; i++) {
-        if (!poses[i].valid) continue;
-        fprintf(f, "%s  \"frame_%04d\": {\n    \"person_0\": {\n", first ? "" : ",\n", i + inserted);
-        first = 0;
-        inserted += gap;
-        for (int j = 0; j < POSE_JOINTS; j++)
-            fprintf(f, "      \"%s\": {\n        \"x\": %.6f,\n        \"y\": %.6f,\n        \"z\": %.6f\n      }%s\n",
-                    PoseNames[j], poses[i].p[j].x / w, poses[i].p[j].y / h, poses[i].p[j].z, j + 1 < POSE_JOINTS ? "," : "");
-        fputs("    }\n  }", f);
-    }
-    fputs("\n}\n", f);
-    return fclose(f) == 0;
 }
 
 #endif

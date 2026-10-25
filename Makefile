@@ -26,7 +26,7 @@ LINUX_LIB = $(RAYLIB_BUILD)/linux
 LINUX_CFLAGS = -std=c99 -O2 -Wall -Wextra -I. -I$(RAYLIB_SRC)
 LINUX_LIBS = libLiteRt.so -lraylib -lGL -lm -lpthread -ldl -lrt -lX11 -Wl,-rpath,'$$ORIGIN'
 
-SOURCES = main.c pose.h pose_model.h
+SOURCES = main.c pose.h pose_model.h pose_export.h body_model.h
 
 ifeq ($(shell echo "test"),"test")
 winpath = $(subst /,\,$(1))
