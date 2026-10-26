@@ -1,5 +1,7 @@
 # Normals 3D
 
+https://github.com/user-attachments/assets/648bfc9e-e568-4bc9-8b0a-a347465f21f6
+
 A C desktop tool that turns 2D sprites and animated images into relightable 3D assets, with pose estimation and skeletal animation export.
 
 Normals 3D takes an image or GIF, generates normal and depth maps, presents them as a billboard with real-time dynamic lighting, detects an 18-joint skeleton (OpenPose format) using a locally executed machine learning model, and exports the animation as clean, smoothed, keyframe-reduced JSON.
