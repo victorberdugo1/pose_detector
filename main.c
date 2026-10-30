@@ -29,6 +29,18 @@
 #define EXPORT_TOGGLE_WIDTH 116.0f
 #define EXPORT_TOGGLE_SPACING 6.0f
 #define EXPORT_TOGGLE_MARGIN 12.0f
+#define INSPECTOR_SPAN_DEFAULT 3
+#define INSPECTOR_SPAN_MAX 30
+#define ONION_MAX 8
+#define ONION_DEFAULT 2
+#define ONION_ALPHA 255
+#define BOTTOM_ROW_HEIGHT 20.0f
+#define BOTTOM_ROW_RIGHT 96.0f
+#define BOTTOM_SPACING 8.0f
+#define ONION_OPACITY_DEFAULT 60
+#define ONION_OPACITY_MIN 10
+#define ONION_OPACITY_MAX 100
+#define ONION_OPACITY_STEP 10
 #define POSE_PICK_RADIUS 12.0f
 #define LIGHT_COUNT 3
 #define OPPOSITE_LIGHT_ANGLE 3.14159265f
@@ -107,6 +119,24 @@ static PoseExportResult exportResult = { 0 };
 static PoseExportOptions exportBuilt = { 0 };
 static int exportBuiltRevision = -1;
 
+typedef enum {
+    VIEW_ONION,
+    VIEW_BONES,
+    VIEW_BOTH,
+    VIEW_COUNT
+} ViewMode;
+
+static ViewMode viewMode = VIEW_ONION;
+static int onionOpacity = ONION_OPACITY_DEFAULT;
+static bool inspectorOn = false;
+static int impactFrame = -1;
+static int inspectorBefore = INSPECTOR_SPAN_DEFAULT;
+static int inspectorAfter = INSPECTOR_SPAN_DEFAULT;
+static Texture2D onionTextures[2 * ONION_MAX];
+static int onionCount = ONION_DEFAULT;
+static int onionKeyFrame = -1;
+static int onionKeyCount = -1;
+
 static float lightStrength = 1.5f;
 static float lightSpeed = 1.0f;
 static float lightAngle = 0.0f;
@@ -122,7 +152,7 @@ static Vector2 billboardSize = { 3.5f, 3.5f };
 static const Vector3 BOARD_CENTER = { 0.0f, 2.0f, 0.0f };
 
 static char statusText[256] =
-    "Arrastra una imagen o GIF a la ventana o pega su ruta con Ctrl+V";
+    "Drag an image or GIF into the window or paste its path with Ctrl+V";
 
 static PoseModel poseModel = { 0 };
 static bool poseModelReady = false;
@@ -342,10 +372,62 @@ static Rectangle TimelineRect(void)
     return (Rectangle){ Ui(24.0f), Ui(98.0f), (float)GetScreenWidth() - Ui(48.0f), Ui(10.0f) };
 }
 
+static bool InspectorActive(void)
+{
+    return poseMode && inspectorOn && impactFrame >= 0 && frameCount > 1;
+}
+
+static void InspectorRange(int *lo, int *hi)
+{
+    *lo = impactFrame - inspectorBefore;
+    *hi = impactFrame + inspectorAfter;
+
+    if (*lo < 0)
+        *lo = 0;
+
+    if (*hi > frameCount - 1)
+        *hi = frameCount - 1;
+}
+
+static bool InspectorContains(int index)
+{
+    int lo, hi;
+
+    if (!InspectorActive())
+        return false;
+
+    InspectorRange(&lo, &hi);
+
+    return index >= lo && index <= hi;
+}
+
+static int NextFrameIndex(int direction)
+{
+    if (!InspectorActive())
+        return (frameIndex + direction + frameCount) % frameCount;
+
+    int lo, hi;
+
+    InspectorRange(&lo, &hi);
+
+    if (frameIndex < lo || frameIndex > hi)
+        return frameIndex < lo ? lo : hi;
+
+    int next = frameIndex + direction;
+
+    if (next > hi)
+        return lo;
+
+    if (next < lo)
+        return hi;
+
+    return next;
+}
+
 static void StepFrame(int direction)
 {
     playing = false;
-    ShowFrame((frameIndex + direction + frameCount) % frameCount);
+    ShowFrame(NextFrameIndex(direction));
 }
 
 static bool ExportMarks(void)
@@ -382,6 +464,14 @@ static void UpdateTimeline(void)
     int index = (int)((mouse.x - bar.x) / bar.width * slots) / TimelineStep();
     index = index < 0 ? 0 : (index >= frameCount ? frameCount - 1 : index);
 
+    if (InspectorActive())
+    {
+        int lo, hi;
+
+        InspectorRange(&lo, &hi);
+        index = index < lo ? lo : (index > hi ? hi : index);
+    }
+
     if (index != frameIndex)
     {
         playing = false;
@@ -405,6 +495,11 @@ static void DrawTimeline(void)
         if (ExportMarks())
             color = !filled ? (Color){ 28, 32, 42, 255 }
                 : (exportResult.keep[frame] ? (Color){ 70, 160, 120, 255 } : (Color){ 42, 48, 62, 255 });
+
+        if (!exportPreview && filled && frame == impactFrame)
+            color = SKYBLUE;
+        else if (!exportPreview && filled && InspectorContains(frame))
+            color = (Color){ 90, 110, 140, 255 };
 
         DrawRectangleRec(
             (Rectangle){ bar.x + i * cell + Ui(1.0f), bar.y, cell - Ui(2.0f), bar.height },
@@ -434,6 +529,15 @@ static void UnloadSprite(void)
     free(poses);
     free(frameFlips);
     PoseExportFree(&exportResult);
+    for (int i = 0; i < 2 * ONION_MAX; i++)
+    {
+        if (onionTextures[i].id != 0)
+            UnloadTexture(onionTextures[i]);
+
+        onionTextures[i] = (Texture2D){ 0 };
+    }
+    onionKeyFrame = -1;
+    onionKeyCount = -1;
     poseRevision++;
     sprite = (Image){ 0 };
     normalFrames = NULL;
@@ -456,7 +560,7 @@ static bool LoadDroppedImage(const char *path)
             path, ".png;.jpg;.jpeg;.bmp;.gif;.tga"))
     {
         snprintf(statusText, sizeof(statusText),
-                 "Formato no compatible: %s", GetFileName(path));
+                 "Unsupported format: %s", GetFileName(path));
         return false;
     }
 
@@ -467,7 +571,7 @@ static bool LoadDroppedImage(const char *path)
     {
         UnloadImage(anim);
         snprintf(statusText, sizeof(statusText),
-                 "No se pudo abrir: %s", GetFileName(path));
+                 "Could not open: %s", GetFileName(path));
         return false;
     }
 
@@ -491,7 +595,7 @@ static bool LoadDroppedImage(const char *path)
         free(newDepthPixels);
         free(newPoses);
         UnloadImage(anim);
-        snprintf(statusText, sizeof(statusText), "Memoria insuficiente");
+        snprintf(statusText, sizeof(statusText), "Not enough memory");
         return false;
     }
 
@@ -556,7 +660,7 @@ static bool LoadDroppedImage(const char *path)
         UnloadImage(anim);
 
         snprintf(statusText, sizeof(statusText),
-                 "No se pudieron crear las texturas");
+                 "Could not create textures");
         return false;
     }
 
@@ -579,6 +683,8 @@ static bool LoadDroppedImage(const char *path)
     frameCount = frames;
     frameIndex = 0;
     frameClock = 0.0f;
+    impactFrame = -1;
+    inspectorOn = false;
     dragJoint = -1;
     playing = frames > 1;
     originalTexture = newOriginal;
@@ -1070,7 +1176,7 @@ static void ExportPoses(void)
 
     snprintf(statusText, sizeof(statusText),
              PoseExportJson(out, poses, frameCount, sprite.width, sprite.height, &exportOptions)
-                 ? "Exportado: %s" : "No se pudo escribir: %s",
+                 ? "Exported: %s" : "Could not write: %s",
              GetFileName(out));
 }
 
@@ -1125,7 +1231,7 @@ static void DrawExportGap(void)
 {
     Rectangle minus = ExportGapButton(false);
     Rectangle plus = ExportGapButton(true);
-    const char *label = TextFormat("Vacios: %d", exportOptions.emptyFrames);
+    const char *label = TextFormat("Gaps: %d", exportOptions.emptyFrames);
     float left = minus.x + minus.width;
     float labelX = left + (plus.x - left - MeasureUiText(label, TEXT_BODY)) * 0.5f;
 
@@ -1142,11 +1248,11 @@ typedef struct {
 } ExportToggle;
 
 static const ExportToggle exportToggles[] = {
-    { "Suelo", &exportOptions.ground, 1, KEY_ONE },
-    { "Aspecto", &exportOptions.aspect, 1, KEY_TWO },
-    { "Suavizado", &exportOptions.smooth, POSE_EXPORT_LEVELS, KEY_THREE },
+    { "Ground", &exportOptions.ground, 1, KEY_ONE },
+    { "Aspect", &exportOptions.aspect, 1, KEY_TWO },
+    { "Smoothing", &exportOptions.smooth, POSE_EXPORT_LEVELS, KEY_THREE },
     { "Keyframes", &exportOptions.keys, POSE_EXPORT_LEVELS, KEY_FOUR },
-    { "Resultado", &exportPreview, 1, KEY_FIVE }
+    { "Result", &exportPreview, 1, KEY_FIVE }
 };
 
 #define EXPORT_TOGGLE_COUNT ((int)(sizeof exportToggles / sizeof exportToggles[0]))
@@ -1186,7 +1292,7 @@ static void DrawExportToggles(void)
         int level = *toggle->level;
         const char *label = level == 0
             ? TextFormat("%s: no", toggle->name)
-            : (toggle->max > 1 ? TextFormat("%s: %d", toggle->name, level) : TextFormat("%s: si", toggle->name));
+            : (toggle->max > 1 ? TextFormat("%s: %d", toggle->name, level) : TextFormat("%s: yes", toggle->name));
 
         DrawRectangleRec(rect, CheckCollisionPointRec(GetMousePosition(), rect)
             ? (Color){ 70, 80, 100, 255 }
@@ -1198,6 +1304,162 @@ static void DrawExportToggles(void)
             TEXT_SMALL, level > 0 ? GOLD : LIGHTGRAY
         );
     }
+}
+
+static bool ViewControlsVisible(void)
+{
+    return poseMode && hasImage && !exportPreview;
+}
+
+static const char *ViewModeName(void)
+{
+    static const char *const names[VIEW_COUNT] = { "Onion", "Bones", "Both" };
+
+    return names[viewMode];
+}
+
+typedef enum {
+    CTRL_INSPECTOR,
+    CTRL_IMPACT,
+    CTRL_BEFORE_DOWN, CTRL_BEFORE_VALUE, CTRL_BEFORE_UP,
+    CTRL_AFTER_DOWN, CTRL_AFTER_VALUE, CTRL_AFTER_UP,
+    CTRL_MODE,
+    CTRL_ONION_DOWN, CTRL_ONION_VALUE, CTRL_ONION_UP,
+    CTRL_OPACITY_DOWN, CTRL_OPACITY_VALUE, CTRL_OPACITY_UP,
+    CTRL_COUNT
+} BottomControl;
+
+static const float BottomControlWidth[CTRL_COUNT] = {
+    100.0f, 96.0f,
+    22.0f, 80.0f, 22.0f,
+    22.0f, 80.0f, 22.0f,
+    130.0f,
+    22.0f, 84.0f, 22.0f,
+    22.0f, 104.0f, 22.0f
+};
+
+static void LayoutBottomControls(Rectangle rects[CTRL_COUNT])
+{
+    float right = (float)GetScreenWidth() - Ui(BOTTOM_ROW_RIGHT);
+
+    for (int i = CTRL_COUNT - 1; i >= 0; i--)
+    {
+        float width = Ui(BottomControlWidth[i]);
+
+        rects[i] = (Rectangle){
+            right - width, (float)GetScreenHeight() - Ui(BOTTOM_ROW_HEIGHT),
+            width, Ui(BOTTOM_ROW_HEIGHT)
+        };
+        right = rects[i].x - Ui(BOTTOM_SPACING);
+    }
+}
+
+static void InspectorToggle(void)
+{
+    inspectorOn = !inspectorOn;
+
+    if (!inspectorOn)
+        return;
+
+    viewMode = VIEW_BOTH;
+
+    if (impactFrame < 0)
+        impactFrame = frameIndex;
+}
+
+static void UpdateBottomControls(void)
+{
+    if (!ViewControlsVisible() || !IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        return;
+
+    Rectangle r[CTRL_COUNT];
+    Vector2 mouse = GetMousePosition();
+
+    LayoutBottomControls(r);
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_INSPECTOR]))
+        InspectorToggle();
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_IMPACT]))
+        impactFrame = frameIndex;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_BEFORE_DOWN]) && inspectorBefore > 0)
+        inspectorBefore--;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_BEFORE_UP]) && inspectorBefore < INSPECTOR_SPAN_MAX)
+        inspectorBefore++;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_AFTER_DOWN]) && inspectorAfter > 0)
+        inspectorAfter--;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_AFTER_UP]) && inspectorAfter < INSPECTOR_SPAN_MAX)
+        inspectorAfter++;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_MODE]))
+    {
+        viewMode = (ViewMode)((viewMode + 1) % VIEW_COUNT);
+        dragJoint = -1;
+    }
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_ONION_DOWN]) && onionCount > 1)
+        onionCount--;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_ONION_UP]) && onionCount < ONION_MAX)
+        onionCount++;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_OPACITY_DOWN]) && onionOpacity > ONION_OPACITY_MIN)
+        onionOpacity -= ONION_OPACITY_STEP;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_OPACITY_UP]) && onionOpacity < ONION_OPACITY_MAX)
+        onionOpacity += ONION_OPACITY_STEP;
+}
+
+static void DrawBottomButton(Rectangle rect, const char *text)
+{
+    Color background = CheckCollisionPointRec(GetMousePosition(), rect)
+        ? (Color){ 70, 80, 100, 255 }
+        : (Color){ 45, 52, 68, 255 };
+
+    DrawRectangleRec(rect, background);
+    DrawUiText(
+        text,
+        rect.x + (rect.width - MeasureUiText(text, TEXT_SMALL)) * 0.5f,
+        rect.y + Ui(3.0f),
+        TEXT_SMALL, RAYWHITE
+    );
+}
+
+static void DrawBottomValue(Rectangle rect, const char *text)
+{
+    DrawUiText(
+        text,
+        rect.x + (rect.width - MeasureUiText(text, TEXT_SMALL)) * 0.5f,
+        rect.y + Ui(3.0f),
+        TEXT_SMALL, RAYWHITE
+    );
+}
+
+static void DrawBottomControls(void)
+{
+    Rectangle r[CTRL_COUNT];
+
+    LayoutBottomControls(r);
+
+    DrawBottomButton(r[CTRL_INSPECTOR], inspectorOn ? "Inspector: on" : "Inspector: off");
+    DrawBottomButton(r[CTRL_IMPACT], impactFrame < 0 ? "Impact: -" : TextFormat("Impact: %d", impactFrame + 1));
+    DrawBottomButton(r[CTRL_BEFORE_DOWN], "-");
+    DrawBottomValue(r[CTRL_BEFORE_VALUE], TextFormat("Before: %d", inspectorBefore));
+    DrawBottomButton(r[CTRL_BEFORE_UP], "+");
+    DrawBottomButton(r[CTRL_AFTER_DOWN], "-");
+    DrawBottomValue(r[CTRL_AFTER_VALUE], TextFormat("After: %d", inspectorAfter));
+    DrawBottomButton(r[CTRL_AFTER_UP], "+");
+    DrawBottomButton(r[CTRL_MODE], TextFormat("View: %s", ViewModeName()));
+    DrawBottomButton(r[CTRL_ONION_DOWN], "-");
+    DrawBottomValue(r[CTRL_ONION_VALUE], TextFormat("Onion: %d", onionCount));
+    DrawBottomButton(r[CTRL_ONION_UP], "+");
+    DrawBottomButton(r[CTRL_OPACITY_DOWN], "-");
+    DrawBottomValue(r[CTRL_OPACITY_VALUE], TextFormat("Opacity: %d%%", onionOpacity));
+    DrawBottomButton(r[CTRL_OPACITY_UP], "+");
 }
 
 static void RedetectPose(int index)
@@ -1223,7 +1485,7 @@ static void ReloadPoses(void)
     if (!poses[frameIndex].valid)
     {
         snprintf(statusText, sizeof(statusText),
-                 "El frame %d no tiene pose de referencia", frameIndex + 1);
+                 "Frame %d has no reference pose", frameIndex + 1);
         return;
     }
 
@@ -1239,7 +1501,7 @@ static void ReloadPoses(void)
     }
 
     snprintf(statusText, sizeof(statusText),
-             "Animacion recalculada desde el frame %d", frameIndex + 1);
+             "Animation recalculated from frame %d", frameIndex + 1);
 }
 
 static void MoveJoints(Pose *pose, int joint, float dx, float dy, float dz, float range)
@@ -1283,7 +1545,7 @@ static void UpdatePoseEditor(void)
 
     Rectangle side = SidePanelRect();
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid && !exportPreview)
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid && !exportPreview && viewMode != VIEW_ONION)
     {
         float best = Ui(POSE_PICK_RADIUS);
 
@@ -1467,27 +1729,27 @@ static void DrawExportPreview(Rectangle view, Rectangle side)
     DrawRectangleLinesEx(view, Ui(1.0f), (Color){ 70, 80, 100, 255 });
     DrawLine((int)centerX, (int)view.y, (int)centerX, (int)floorY, (Color){ 52, 58, 74, 255 });
     DrawLineEx((Vector2){ view.x, floorY }, (Vector2){ view.x + view.width, floorY }, Ui(2.0f), (Color){ 70, 160, 120, 255 });
-    DrawUiText("suelo", view.x + Ui(8.0f), floorY - Ui(20.0f), TEXT_SMALL, (Color){ 70, 160, 120, 255 });
+    DrawUiText("ground", view.x + Ui(8.0f), floorY - Ui(20.0f), TEXT_SMALL, (Color){ 70, 160, 120, 255 });
 
     DrawUiText(
-        TextFormat("Resultado de exportacion | %d de %d frames | %d con vacios", sent, frameCount, TimelineSlots()),
+        TextFormat("Export result | %d of %d frames | %d with gaps", sent, frameCount, TimelineSlots()),
         view.x + Ui(10.0f), view.y + Ui(8.0f), TEXT_BODY, RAYWHITE
     );
-    DrawUiText("gris: deteccion | color: exportado", view.x + Ui(10.0f), view.y + Ui(30.0f), TEXT_SMALL, GRAY);
+    DrawUiText("gray: detection | color: exported", view.x + Ui(10.0f), view.y + Ui(30.0f), TEXT_SMALL, GRAY);
 
     int k = PoseExportFind(&exportResult, frameIndex);
     float shown[POSE_JOINTS][3];
 
     if (!PoseExportSample(&exportResult, frameIndex, shown))
     {
-        DrawUiText("Sin pose para este frame", view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, GOLD);
+        DrawUiText("No pose for this frame", view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, GOLD);
         return;
     }
 
     DrawUiText(
         exportResult.keep[frameIndex]
-            ? TextFormat("frame_%04d | exportado", frameIndex * (exportOptions.emptyFrames + 1))
-            : "interpolado entre keyframes",
+            ? TextFormat("frame_%04d | exported", frameIndex * (exportOptions.emptyFrames + 1))
+            : "interpolated between keyframes",
         view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, exportResult.keep[frameIndex] ? GOLD : SKYBLUE
     );
 
@@ -1529,6 +1791,93 @@ static void DrawExportPreview(Rectangle view, Rectangle side)
     }
 }
 
+static void DrawSideSkeleton(const Pose *pose, Rectangle side, Rectangle view, int highlight)
+{
+    Vector3 sideK[POSE_JOINTS + 1];
+    float pivot = SidePivot(pose);
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+    {
+        Vector2 lateral = PoseToSide(side, view, pivot, pose->p[j]);
+
+        sideK[j] = (Vector3){ lateral.x, -lateral.y, SideToward(side, view, pivot, pose->p[j]) };
+    }
+
+    FillPelvis3D(sideK);
+    DrawBones3D(sideK, side, Ui(3.0f), Ui(7.0f), highlight, false);
+}
+
+static void DrawFrontSkeleton(const Pose *pose, Rectangle view, int highlight)
+{
+    Vector3 frontK[POSE_JOINTS + 1];
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+    {
+        Vector2 screen = PoseToScreen(view, pose->p[j]);
+
+        frontK[j] = (Vector3){ screen.x, -screen.y, (pose->p[j].z - 0.5f) * view.height };
+    }
+
+    FillPelvis3D(frontK);
+    DrawBones3D(frontK, view, Ui(2.0f), Ui(5.0f), highlight, false);
+}
+
+static void DrawSideBody(const Pose *pose, Rectangle side, Rectangle view)
+{
+    SideItem sideItems[SIDE_ITEM_MAX];
+    int sideCount = BuildSideItems(pose, side, view, sideItems);
+
+    qsort(sideItems, sideCount, sizeof *sideItems, CompareSideItems);
+    DrawSideItems(sideItems, sideCount);
+}
+
+static void OnionLoad(int slot, int frame)
+{
+    Image image = FrameView(sprite.data, sprite.width, sprite.height, frame);
+
+    if (onionTextures[slot].id == 0)
+    {
+        onionTextures[slot] = LoadTextureFromImage(image);
+        SetTextureFilter(onionTextures[slot], TEXTURE_FILTER_BILINEAR);
+        return;
+    }
+
+    UpdateTexture(onionTextures[slot], image.data);
+}
+
+static void OnionRefresh(void)
+{
+    if (onionKeyFrame == frameIndex && onionKeyCount == onionCount)
+        return;
+
+    onionKeyFrame = frameIndex;
+    onionKeyCount = onionCount;
+
+    for (int k = 1; k <= onionCount; k++)
+    {
+        OnionLoad(k - 1, ((frameIndex - k) % frameCount + frameCount) % frameCount);
+        OnionLoad(ONION_MAX + k - 1, (frameIndex + k) % frameCount);
+    }
+}
+
+static void DrawOnionFrames(Rectangle view, Rectangle source)
+{
+    if (frameCount < 2)
+        return;
+
+    OnionRefresh();
+
+    for (int k = onionCount; k >= 1; k--)
+    {
+        unsigned char alpha = (unsigned char)(ONION_ALPHA * (onionCount + 1 - k) * onionOpacity / (onionCount * 100));
+        Color earlier = { 110, 255, 150, alpha };
+        Color later = { 110, 170, 255, alpha };
+
+        DrawTexturePro(onionTextures[k - 1], source, view, (Vector2){ 0.0f, 0.0f }, 0.0f, earlier);
+        DrawTexturePro(onionTextures[ONION_MAX + k - 1], source, view, (Vector2){ 0.0f, 0.0f }, 0.0f, later);
+    }
+}
+
 static void DrawPoseView(void)
 {
     Rectangle view = PoseViewRect();
@@ -1541,11 +1890,16 @@ static void DrawPoseView(void)
     DrawRectangleRec(view, (Color){ 30, 34, 46, 255 });
 
     if (!exportPreview)
+    {
+        if (viewMode != VIEW_BONES && !showDepth)
+            DrawOnionFrames(view, source);
+
         DrawTexturePro(
             showDepth ? depthTexture : originalTexture,
             showDepth ? (Rectangle){ 0.0f, 0.0f, (float)depthTexture.width, (float)depthTexture.height } : source,
             view, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE
         );
+    }
 
     Rectangle side = SidePanelRect();
     float sideCenter = side.x + side.width * 0.5f;
@@ -1560,9 +1914,9 @@ static void DrawPoseView(void)
                  t == 0 ? (Color){ 90, 100, 125, 255 } : (Color){ 52, 58, 74, 255 });
     }
 
-    DrawUiText("Vista lateral (z) | fondo: girar", side.x + Ui(10.0f), side.y + Ui(8.0f), TEXT_BODY, RAYWHITE);
-    DrawUiText("lejos", side.x + Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
-    DrawUiTextRight("cerca", side.x + side.width - Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
+    DrawUiText("Side view (z) | background: rotate", side.x + Ui(10.0f), side.y + Ui(8.0f), TEXT_BODY, RAYWHITE);
+    DrawUiText("far", side.x + Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
+    DrawUiTextRight("near", side.x + side.width - Ui(10.0f), side.y + Ui(32.0f), TEXT_SMALL, GRAY);
 
     if (exportPreview)
     {
@@ -1577,24 +1931,11 @@ static void DrawPoseView(void)
 
     DrawSideBillboard(side, view, SidePivot(pose), source);
 
-    SideItem sideItems[SIDE_ITEM_MAX];
-    int sideCount = BuildSideItems(pose, side, view, sideItems);
+    if (viewMode == VIEW_ONION)
+        return;
 
-    qsort(sideItems, sideCount, sizeof *sideItems, CompareSideItems);
-    DrawSideItems(sideItems, sideCount);
-
-    Vector3 sideK[POSE_JOINTS + 1];
-    float sidePivot = SidePivot(pose);
-
-    for (int j = 0; j < POSE_JOINTS; j++)
-    {
-        Vector2 lateral = PoseToSide(side, view, sidePivot, pose->p[j]);
-
-        sideK[j] = (Vector3){ lateral.x, -lateral.y, SideToward(side, view, sidePivot, pose->p[j]) };
-    }
-
-    FillPelvis3D(sideK);
-    DrawBones3D(sideK, side, Ui(3.0f), Ui(7.0f), dragSide ? dragJoint : -1, false);
+    DrawSideBody(pose, side, view);
+    DrawSideSkeleton(pose, side, view, dragSide ? dragJoint : -1);
 
     if (dragJoint >= 0)
         DrawUiText(
@@ -1602,17 +1943,7 @@ static void DrawPoseView(void)
             side.x + Ui(10.0f), side.y + side.height - Ui(28.0f), TEXT_BODY, RAYWHITE
         );
 
-    Vector3 frontK[POSE_JOINTS + 1];
-
-    for (int j = 0; j < POSE_JOINTS; j++)
-    {
-        Vector2 screen = PoseToScreen(view, pose->p[j]);
-
-        frontK[j] = (Vector3){ screen.x, -screen.y, (pose->p[j].z - 0.5f) * view.height };
-    }
-
-    FillPelvis3D(frontK);
-    DrawBones3D(frontK, view, Ui(2.0f), Ui(5.0f), dragJoint, false);
+    DrawFrontSkeleton(pose, view, dragJoint);
 }
 
 static bool LoadImageFromPathText(const char *text)
@@ -1693,7 +2024,7 @@ int main(int argc, char **argv)
     );
 
     if (!poseModelReady)
-        snprintf(statusText, sizeof(statusText), "Modelo de pose no encontrado: usando heuristica");
+        snprintf(statusText, sizeof(statusText), "Pose model not found: using heuristic");
 
     bodyModelReady = BodyModelOpen(
         &bodyModel,
@@ -1701,7 +2032,7 @@ int main(int argc, char **argv)
     );
 
     if (!bodyModelReady)
-        snprintf(statusText, sizeof(statusText), "Modelo del cuerpo no encontrado: " BODY_MODEL_FILE);
+        snprintf(statusText, sizeof(statusText), "Body model not found: " BODY_MODEL_FILE);
 
     int locLight1 = GetShaderLocation(lightShader, "lightLocal1");
     int locLight2 = GetShaderLocation(lightShader, "lightLocal2");
@@ -1788,7 +2119,7 @@ int main(int argc, char **argv)
                 if (frameClock >= 1.0f / GIF_FPS)
                 {
                     frameClock = fmodf(frameClock, 1.0f / GIF_FPS);
-                    ShowFrame((frameIndex + 1) % frameCount);
+                    ShowFrame(NextFrameIndex(1));
                 }
             }
         }
@@ -1798,6 +2129,7 @@ int main(int argc, char **argv)
             UpdateExportGap();
             UpdateExportToggles();
             UpdatePoseEditor();
+            UpdateBottomControls();
         }
 
         if (IsKeyPressed(KEY_L))
@@ -1927,11 +2259,11 @@ int main(int argc, char **argv)
         DrawUiText(
             hasImage
                 ? (poseMode
-                    ? "Editor de poses | OpenPose 18"
+                    ? "Pose editor | OpenPose 18"
                     : (showNormals
-                        ? "Billboard 3D | Mapa de normales"
-                        : "Billboard 3D | Dos luces en tiempo real"))
-                : "Arrastra una imagen o GIF a esta ventana",
+                        ? "3D billboard | Normal map"
+                        : "3D billboard | Two lights in real time"))
+                : "Drag an image or GIF into this window",
             Ui(24.0f), Ui(52.0f), TEXT_HEADING, SKYBLUE
         );
 
@@ -1953,8 +2285,8 @@ int main(int argc, char **argv)
             );
 
         DrawUiTextRight(
-            draggingLights ? "LUCES: MANUALES" :
-                (autoLight ? "LUCES: AUTOMATICAS" : "LUCES: PAUSADAS"),
+            draggingLights ? "LIGHTS: MANUAL" :
+                (autoLight ? "LIGHTS: AUTO" : "LIGHTS: PAUSED"),
             screenW - Ui(24.0f), Ui(22.0f), TEXT_HEADING,
             draggingLights ? WHITE : (autoLight ? GOLD : LIGHTGRAY)
         );
@@ -1965,25 +2297,25 @@ int main(int argc, char **argv)
         );
 
         DrawUiText(
-            "Arrastrar o Ctrl+V ruta | ESPACIO: normales | L: luces | P: poses | G: animar | A D o , . : frame | barra superior",
+            "Drag or Ctrl+V a path | SPACE: normals | L: lights | P: poses | G: animate | A D or , . : frame | top bar",
             Ui(20.0f), screenH - Ui(82.0f), TEXT_BODY, RAYWHITE
         );
 
         DrawUiText(
             poseMode
-                ? "Clic izquierdo + arrastrar: mover articulacion | R: redetectar | J: exportar JSON | 1-4: opciones | 5: ver resultado | Z: depth map"
-                : "Clic izquierdo + arrastrar: mover las tres luces",
+                ? "Left click + drag: move joint | R: re-detect | J: export JSON | 1-4: options | 5: show result | Z: depth map"
+                : "Left click + drag: move the three lights",
             Ui(20.0f), screenH - Ui(59.0f), TEXT_BODY, LIGHTGRAY
         );
 
         DrawUiText(
-            "Boton derecho + arrastrar: camara | Rueda: zoom",
+            "Right click + drag: camera | Wheel: zoom",
             Ui(20.0f), screenH - Ui(36.0f), TEXT_BODY, LIGHTGRAY
         );
 
         DrawUiText(
             TextFormat(
-                "Intensidad %.1f | Velocidad %.1f",
+                "Intensity %.1f | Speed %.1f",
                 lightStrength, lightSpeed
             ),
             Ui(20.0f), screenH - Ui(17.0f), TEXT_SMALL, GRAY
@@ -1993,6 +2325,9 @@ int main(int argc, char **argv)
             TextFormat("%d FPS", GetFPS()),
             screenW - Ui(24.0f), screenH - Ui(17.0f), TEXT_SMALL, GRAY
         );
+
+        if (ViewControlsVisible())
+            DrawBottomControls();
 
         EndDrawing();
     }
