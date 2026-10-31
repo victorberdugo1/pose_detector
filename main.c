@@ -128,13 +128,6 @@ static ExportCache exportCache = { .revision = -1 };
 static ExportCache compareCache = { .revision = -1 };
 
 typedef enum {
-    VIEW_ONION,
-    VIEW_BONES,
-    VIEW_BOTH,
-    VIEW_COUNT
-} ViewMode;
-
-typedef enum {
     LAYER_RAW,
     LAYER_SMOOTH,
     LAYER_COUNT
@@ -154,7 +147,8 @@ static CompareStyle compareLayers[LAYER_COUNT] = {
 static RenderTexture2D layerTarget = { 0 };
 static bool compareOn = false;
 
-static ViewMode viewMode = VIEW_BOTH;
+static bool onionOn = true;
+static bool bonesOn = true;
 static int onionOpacity = ONION_OPACITY_DEFAULT;
 static bool inspectorOn = false;
 static int impactFrame = -1;
@@ -1340,13 +1334,6 @@ static bool ViewControlsVisible(void)
     return poseMode && hasImage && !exportPreview;
 }
 
-static const char *ViewModeName(void)
-{
-    static const char *const names[VIEW_COUNT] = { "Onion", "Bones", "Both" };
-
-    return names[viewMode];
-}
-
 enum { LAYER_TOGGLE, LAYER_DOWN, LAYER_VALUE, LAYER_UP, LAYER_CONTROLS };
 
 typedef enum {
@@ -1354,7 +1341,7 @@ typedef enum {
     CTRL_IMPACT,
     CTRL_BEFORE_DOWN, CTRL_BEFORE_VALUE, CTRL_BEFORE_UP,
     CTRL_AFTER_DOWN, CTRL_AFTER_VALUE, CTRL_AFTER_UP,
-    CTRL_MODE,
+    CTRL_ONION_CHECK, CTRL_BONES_CHECK,
     CTRL_ONION_DOWN, CTRL_ONION_VALUE, CTRL_ONION_UP,
     CTRL_OPACITY_DOWN, CTRL_OPACITY_VALUE, CTRL_OPACITY_UP,
     CTRL_COMPARE,
@@ -1369,17 +1356,17 @@ static float BottomControlWidth(int control)
         100.0f, 96.0f,
         22.0f, 80.0f, 22.0f,
         22.0f, 80.0f, 22.0f,
-        130.0f,
+        72.0f, 74.0f,
         22.0f, 84.0f, 22.0f,
         22.0f, 104.0f, 22.0f
     };
-    static const float layer[LAYER_CONTROLS] = { 110.0f, 22.0f, 84.0f, 22.0f };
+    static const float layer[LAYER_CONTROLS] = { 100.0f, 22.0f, 84.0f, 22.0f };
 
     if (control < CTRL_COMPARE)
         return row[control];
 
     if (control == CTRL_COMPARE)
-        return 150.0f;
+        return 100.0f;
 
     return control == CTRL_PLAY ? 90.0f : layer[(control - CTRL_LAYER_FIRST) % LAYER_CONTROLS];
 }
@@ -1412,7 +1399,8 @@ static void InspectorToggle(void)
     if (!inspectorOn)
         return;
 
-    viewMode = VIEW_BOTH;
+    onionOn = true;
+    bonesOn = true;
 
     if (impactFrame < 0)
         impactFrame = frameIndex;
@@ -1446,9 +1434,12 @@ static void UpdateBottomControls(void)
     if (CheckCollisionPointRec(mouse, r[CTRL_AFTER_UP]) && inspectorAfter < INSPECTOR_SPAN_MAX)
         inspectorAfter++;
 
-    if (CheckCollisionPointRec(mouse, r[CTRL_MODE]))
+    if (CheckCollisionPointRec(mouse, r[CTRL_ONION_CHECK]))
+        onionOn = !onionOn;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_BONES_CHECK]))
     {
-        viewMode = (ViewMode)((viewMode + 1) % VIEW_COUNT);
+        bonesOn = !bonesOn;
         dragJoint = -1;
     }
 
@@ -1501,7 +1492,7 @@ static void DrawBottomButton(Rectangle rect, const char *text)
     );
 }
 
-static void DrawBottomCheckbox(Rectangle rect, const char *text, bool checked)
+static void DrawBottomCheckbox(Rectangle rect, const char *text, bool checked, Color color)
 {
     float side = rect.height - Ui(8.0f);
     Rectangle box = { rect.x + Ui(6.0f), rect.y + Ui(4.0f), side, side };
@@ -1517,7 +1508,7 @@ static void DrawBottomCheckbox(Rectangle rect, const char *text, bool checked)
             GOLD
         );
 
-    DrawUiText(text, box.x + box.width + Ui(8.0f), rect.y + Ui(3.0f), TEXT_SMALL, RAYWHITE);
+    DrawUiText(text, box.x + box.width + Ui(8.0f), rect.y + Ui(3.0f), TEXT_SMALL, color);
 }
 
 static void DrawBottomValue(Rectangle rect, const char *text)
@@ -1544,14 +1535,15 @@ static void DrawBottomControls(void)
     DrawBottomButton(r[CTRL_AFTER_DOWN], "-");
     DrawBottomValue(r[CTRL_AFTER_VALUE], TextFormat("After: %d", inspectorAfter));
     DrawBottomButton(r[CTRL_AFTER_UP], "+");
-    DrawBottomButton(r[CTRL_MODE], TextFormat("View: %s", ViewModeName()));
+    DrawBottomCheckbox(r[CTRL_ONION_CHECK], "Onion", onionOn, RAYWHITE);
+    DrawBottomCheckbox(r[CTRL_BONES_CHECK], "Bones", bonesOn, RAYWHITE);
     DrawBottomButton(r[CTRL_ONION_DOWN], "-");
     DrawBottomValue(r[CTRL_ONION_VALUE], TextFormat("Onion: %d", onionCount));
     DrawBottomButton(r[CTRL_ONION_UP], "+");
     DrawBottomButton(r[CTRL_OPACITY_DOWN], "-");
     DrawBottomValue(r[CTRL_OPACITY_VALUE], TextFormat("Opacity: %d%%", onionOpacity));
     DrawBottomButton(r[CTRL_OPACITY_UP], "+");
-    DrawBottomCheckbox(r[CTRL_COMPARE], "Raw vs Smoothed", compareOn);
+    DrawBottomCheckbox(r[CTRL_COMPARE], "3D Models", compareOn, RAYWHITE);
     DrawBottomButton(r[CTRL_PLAY], playing ? "Play: on" : "Play: off");
 
     for (int l = 0; l < LAYER_COUNT; l++)
@@ -1559,7 +1551,7 @@ static void DrawBottomControls(void)
         const CompareStyle *layer = &compareLayers[l];
         const Rectangle *c = &r[CTRL_LAYER_FIRST + LAYER_CONTROLS * l];
 
-        DrawBottomButton(c[LAYER_TOGGLE], TextFormat("%s: %s", layer->name, layer->on ? "on" : "off"));
+        DrawBottomCheckbox(c[LAYER_TOGGLE], layer->name, layer->on, layer->tint);
         DrawBottomButton(c[LAYER_DOWN], "-");
         DrawBottomValue(c[LAYER_VALUE], TextFormat("Alpha: %d%%", layer->opacity));
         DrawBottomButton(c[LAYER_UP], "+");
@@ -1649,7 +1641,7 @@ static void UpdatePoseEditor(void)
 
     Rectangle side = SidePanelRect();
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid && !exportPreview && viewMode != VIEW_ONION)
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && pose->valid && !exportPreview && bonesOn && compareLayers[LAYER_RAW].on)
     {
         float best = Ui(POSE_PICK_RADIUS);
 
@@ -1802,9 +1794,8 @@ static void DrawBones3D(const Vector3 *k, Rectangle clip, float boneRadius, floa
     EndScissorMode();
 }
 
-static void DrawExportGhost(const Vector2 *joints)
+static void DrawSkeleton2D(const Vector2 *joints, Color color, float width)
 {
-    const Color ghostColor = { 150, 155, 170, 120 };
     Vector2 p[POSE_JOINTS + 1];
 
     for (int j = 0; j < POSE_JOINTS; j++)
@@ -1812,10 +1803,10 @@ static void DrawExportGhost(const Vector2 *joints)
     p[POSE_PELVIS] = Vector2Scale(Vector2Add(p[POSE_LHIP], p[POSE_RHIP]), 0.5f);
 
     for (int i = 0; i < POSE_BONE_COUNT; i++)
-        DrawLineEx(p[PoseBones[i][0]], p[PoseBones[i][1]], Ui(1.5f), ghostColor);
+        DrawLineEx(p[PoseBones[i][0]], p[PoseBones[i][1]], Ui(width), color);
 
     for (int j = 0; j < POSE_JOINTS; j++)
-        DrawCircleV(p[j], Ui(3.0f), ghostColor);
+        DrawCircleV(p[j], Ui(2.0f * width), color);
 }
 
 static void DrawExportPreview(Rectangle view, Rectangle side)
@@ -1881,6 +1872,7 @@ static void DrawExportPreview(Rectangle view, Rectangle side)
 
     if (k >= 0)
     {
+        const Color ghostColor = { 150, 155, 170, 120 };
         const PoseExportFrame *raw = &exportCache.result.raw[k];
         float rawPivot = (raw->p[POSE_LHIP][0] + raw->p[POSE_RHIP][0]) * 0.5f;
 
@@ -1890,8 +1882,8 @@ static void DrawExportPreview(Rectangle view, Rectangle side)
             rawLateral[j] = ExportToSide(side, view, rawPivot, raw->p[j]);
         }
 
-        DrawExportGhost(rawLateral);
-        DrawExportGhost(rawFront);
+        DrawSkeleton2D(rawLateral, ghostColor, 1.5f);
+        DrawSkeleton2D(rawFront, ghostColor, 1.5f);
     }
 }
 
@@ -1982,6 +1974,57 @@ static void DrawOnionFrames(Rectangle view, Rectangle source)
     }
 }
 
+static bool CompareFrames(const PoseExportFrame *frames[LAYER_COUNT])
+{
+    PoseExportOptions options = { .smooth = exportOptions.smooth };
+
+    RefreshExportCache(&compareCache, &options);
+
+    int k = PoseExportFind(&compareCache.result, frameIndex);
+
+    if (k < 0)
+        return false;
+
+    frames[LAYER_RAW] = &compareCache.result.raw[k];
+    frames[LAYER_SMOOTH] = &compareCache.result.frames[k];
+
+    return true;
+}
+
+static Pose PoseFromExport(const PoseExportFrame *frame)
+{
+    Pose pose = { .valid = 1 };
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+        pose.p[j] = (PosePoint){ frame->p[j][0] * sprite.width, frame->p[j][1] * sprite.height, frame->p[j][2], 0.0f };
+
+    return pose;
+}
+
+static void DrawSmoothedBones(const Pose *raw, Rectangle side, Rectangle view)
+{
+    const PoseExportFrame *frames[LAYER_COUNT];
+
+    if (!CompareFrames(frames))
+        return;
+
+    Pose smooth = PoseFromExport(frames[LAYER_SMOOTH]);
+    float pivot = SidePivot(raw);
+    Vector2 front[POSE_JOINTS], lateral[POSE_JOINTS];
+    Color tint = compareLayers[LAYER_SMOOTH].tint;
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+    {
+        front[j] = PoseToScreen(view, smooth.p[j]);
+        lateral[j] = PoseToSide(side, view, pivot, smooth.p[j]);
+    }
+
+    BeginScissorMode((int)side.x, (int)side.y, (int)side.width, (int)side.height);
+    DrawSkeleton2D(lateral, tint, 2.0f);
+    EndScissorMode();
+    DrawSkeleton2D(front, tint, 2.0f);
+}
+
 static bool FitLayerTarget(void)
 {
     int w = GetScreenWidth();
@@ -2039,31 +2082,27 @@ static void DrawCompareLayers(Rectangle view)
     if (!compareOn)
         return;
 
-    PoseExportOptions options = { .smooth = exportOptions.smooth };
+    const PoseExportFrame *frames[LAYER_COUNT];
 
-    RefreshExportCache(&compareCache, &options);
-
-    int k = PoseExportFind(&compareCache.result, frameIndex);
-
-    if (k < 0 || !bodyModelReady || !FitLayerTarget())
+    if (!CompareFrames(frames) || !bodyModelReady || !FitLayerTarget())
         return;
 
-    const PoseExportFrame *frames[LAYER_COUNT] = {
-        [LAYER_RAW] = &compareCache.result.raw[k],
-        [LAYER_SMOOTH] = &compareCache.result.frames[k]
-    };
-    float legendX = view.x + Ui(10.0f);
+    for (int l = 0; l < LAYER_COUNT; l++)
+        if (compareLayers[l].on)
+            DrawCompareBody(frames[l], view, &compareLayers[l]);
+}
+
+static void DrawCompareLegend(Rectangle view)
+{
+    float x = view.x + Ui(10.0f);
 
     for (int l = 0; l < LAYER_COUNT; l++)
     {
-        const CompareStyle *layer = &compareLayers[l];
-
-        if (!layer->on)
+        if (!compareLayers[l].on)
             continue;
 
-        DrawCompareBody(frames[l], view, layer);
-        DrawUiText(layer->name, legendX, view.y + Ui(8.0f), TEXT_BODY, layer->tint);
-        legendX += MeasureUiText(layer->name, TEXT_BODY) + Ui(14.0f);
+        DrawUiText(compareLayers[l].name, x, view.y + Ui(8.0f), TEXT_BODY, compareLayers[l].tint);
+        x += MeasureUiText(compareLayers[l].name, TEXT_BODY) + Ui(14.0f);
     }
 }
 
@@ -2080,7 +2119,7 @@ static void DrawPoseView(void)
 
     if (!exportPreview)
     {
-        if (viewMode != VIEW_BONES && !showDepth)
+        if (onionOn && !showDepth)
             DrawOnionFrames(view, source);
 
         DrawTexturePro(
@@ -2121,11 +2160,18 @@ static void DrawPoseView(void)
 
     DrawSideBillboard(side, view, SidePivot(pose), source);
 
-    if (viewMode == VIEW_ONION)
+    DrawSideBody(pose, side, view);
+
+    if (compareOn || bonesOn)
+        DrawCompareLegend(view);
+
+    if (!bonesOn)
         return;
 
-    DrawSideBody(pose, side, view);
-    DrawSideSkeleton(pose, side, view, dragSide ? dragJoint : -1);
+    bool rawShown = compareLayers[LAYER_RAW].on;
+
+    if (rawShown)
+        DrawSideSkeleton(pose, side, view, dragSide ? dragJoint : -1);
 
     if (dragJoint >= 0)
         DrawUiText(
@@ -2133,7 +2179,11 @@ static void DrawPoseView(void)
             side.x + Ui(10.0f), side.y + side.height - Ui(28.0f), TEXT_BODY, RAYWHITE
         );
 
-    DrawFrontSkeleton(pose, view, dragJoint);
+    if (rawShown)
+        DrawFrontSkeleton(pose, view, dragJoint);
+
+    if (compareLayers[LAYER_SMOOTH].on)
+        DrawSmoothedBones(pose, side, view);
 }
 
 static bool LoadImageFromPathText(const char *text)

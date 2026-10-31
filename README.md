@@ -24,7 +24,7 @@ Normals 3D takes an image or GIF, generates normal and depth maps, presents them
 - Per-joint depth reconstruction and bone proportion fitting (torso, arms, legs) kept consistent across the whole animation.
 - Interactive editor: joint dragging, per-frame redetection, and learning of head orientation corrections.
 - Synthetic side view for reviewing and correcting depth.
-- Onion skin and bones views, enabled together by default, with an inspector for frames around an impact.
+- Onion and Bones checkboxes, both on by default, with an inspector for frames around an impact. Bones draws the Raw skeleton in joint colors and the Smoothed skeleton in blue.
 - Raw vs Smoothed comparison: both 3D bodies overlaid on the original GIF with adjustable transparency.
 
 ### 3D body model
@@ -118,29 +118,30 @@ The Linux executable embeds `-Wl,-rpath,'$ORIGIN'`, so it locates `libLiteRt.so`
 
 ### Raw vs Smoothed comparison
 
-Enabled from the **Raw vs Smoothed** checkbox in the second row of controls at the bottom of the pose editor. It is off by default and is not available while the export result (`5`) is shown.
+The pose editor compares the original pose data with the smoothed data in two ways, both over the original GIF (never modified) and both without Ground or any floor normalization, so position and framing match the GIF:
 
-When enabled, two 3D bodies are rendered over the original GIF, which is never modified:
-
-| Layer | Source | Color |
+| Type | What it shows | Toggle |
 |---|---|---|
-| Raw | Unsmoothed pose data, including manual edits | Orange |
-| Smoothed | Pose data after the current **Smoothing** level (`3`) | Blue |
+| 3D Models | A Raw and a Smoothed 3D body with adjustable alpha (10% to 100%, default 40%) | **3D Models** checkbox (off by default) |
+| Bones | Raw skeleton in its joint colors (the editable one) and Smoothed skeleton in blue, in the front and side views | **Bones** checkbox (on by default) |
 
-- Neither layer uses the Ground option or any floor normalization, so both keep their original position and framing relative to the GIF.
-- Each layer has its own on/off toggle and alpha (10% to 100%, default 40%).
-- All layers follow the same frame, so they stay synchronized during playback and while stepping.
-- With **Smoothing: no**, the Smoothed layer is identical to Raw.
-- Onion skin and bones remain available and are drawn together with the comparison.
-- Playback runs at the application's GIF frame rate (10 FPS); use it to check that pauses, impacts and timing survive smoothing, and step frame by frame to inspect positional differences.
+Each layer groups its model and its bones. The **Raw** and **Smoothed** checkboxes (second row of controls) show or hide that layer's 3D model and bones together, so you can view only Raw, only Smoothed, or both. The **Alpha** `-` / `+` controls set each layer's model transparency.
+
+- To see only the bones, leave **Bones** on and turn **3D Models** off. To see only the models, do the opposite. To see neither, turn both off for an overlay-off view of the GIF and the side body.
+- Raw uses the unsmoothed pose data, including manual edits; Smoothed uses the current **Smoothing** level (`3`). With **Smoothing: no**, Smoothed is identical to Raw.
+- Raw bones keep their joint colors so moving joints stays readable; dragging a joint edits the Raw skeleton. Joints can be dragged only while Bones is on and the Raw layer is shown.
+- All layers follow the same frame and stay synchronized during playback and while stepping.
+- Playback runs at the application's GIF frame rate (10 FPS). Compare matching frames to see which poses changed, then play to judge pauses, impacts and timing.
+- The **Onion** checkbox works independently of the comparison.
 
 | Control | Action |
 |---|---|
-| **Raw vs Smoothed** checkbox | Show or hide the comparison overlay |
+| **Onion** / **Bones** checkboxes | Show or hide onion skin and the skeleton overlays |
+| **3D Models** checkbox | Show or hide the Raw and Smoothed 3D bodies |
+| **Raw** / **Smoothed** checkboxes | Show or hide each layer's model and bones |
 | **Play** button or `G` | Play or pause at the original frame rate |
 | `A` `D` / `,` `.` / `←` `→` / timeline | Inspect individual frames |
-| **Raw** / **Smoothed** buttons | Toggle each layer |
-| **Alpha** `-` / `+` | Adjust each layer's transparency |
+| **Alpha** `-` / `+` | Adjust each layer's model transparency |
 
 Exported JSON is not affected by the comparison: the **Result** view (`5`) remains dedicated to previewing the export.
 
