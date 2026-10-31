@@ -24,6 +24,8 @@ Normals 3D takes an image or GIF, generates normal and depth maps, presents them
 - Per-joint depth reconstruction and bone proportion fitting (torso, arms, legs) kept consistent across the whole animation.
 - Interactive editor: joint dragging, per-frame redetection, and learning of head orientation corrections.
 - Synthetic side view for reviewing and correcting depth.
+- Onion skin and bones views, enabled together by default, with an inspector for frames around an impact.
+- Raw vs Smoothed comparison: both 3D bodies overlaid on the original GIF with adjustable transparency.
 
 ### 3D body model
 - Loads a rigged character (`body.glb`, binary glTF) and deforms it by skinning, driven by the detected pose.
@@ -113,6 +115,34 @@ The Linux executable embeds `-Wl,-rpath,'$ORIGIN'`, so it locates `libLiteRt.so`
 | View export result | `5` |
 | Depth map | `Z` |
 | Change frame | `←` / `→` |
+
+### Raw vs Smoothed comparison
+
+Enabled from the **Raw vs Smoothed** checkbox in the second row of controls at the bottom of the pose editor. It is off by default and is not available while the export result (`5`) is shown.
+
+When enabled, two 3D bodies are rendered over the original GIF, which is never modified:
+
+| Layer | Source | Color |
+|---|---|---|
+| Raw | Unsmoothed pose data, including manual edits | Orange |
+| Smoothed | Pose data after the current **Smoothing** level (`3`) | Blue |
+
+- Neither layer uses the Ground option or any floor normalization, so both keep their original position and framing relative to the GIF.
+- Each layer has its own on/off toggle and alpha (10% to 100%, default 40%).
+- All layers follow the same frame, so they stay synchronized during playback and while stepping.
+- With **Smoothing: no**, the Smoothed layer is identical to Raw.
+- Onion skin and bones remain available and are drawn together with the comparison.
+- Playback runs at the application's GIF frame rate (10 FPS); use it to check that pauses, impacts and timing survive smoothing, and step frame by frame to inspect positional differences.
+
+| Control | Action |
+|---|---|
+| **Raw vs Smoothed** checkbox | Show or hide the comparison overlay |
+| **Play** button or `G` | Play or pause at the original frame rate |
+| `A` `D` / `,` `.` / `←` `→` / timeline | Inspect individual frames |
+| **Raw** / **Smoothed** buttons | Toggle each layer |
+| **Alpha** `-` / `+` | Adjust each layer's transparency |
+
+Exported JSON is not affected by the comparison: the **Result** view (`5`) remains dedicated to previewing the export.
 
 The JSON is written next to the source image, with the same name and a `.json` extension.
 

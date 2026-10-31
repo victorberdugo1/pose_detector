@@ -38,9 +38,11 @@
 #define BOTTOM_ROW_RIGHT 96.0f
 #define BOTTOM_SPACING 8.0f
 #define ONION_OPACITY_DEFAULT 60
-#define ONION_OPACITY_MIN 10
-#define ONION_OPACITY_MAX 100
-#define ONION_OPACITY_STEP 10
+#define COMPARE_OPACITY_DEFAULT 40
+#define COMPARE_ROW_OFFSET 42.0f
+#define OPACITY_MIN 10
+#define OPACITY_MAX 100
+#define OPACITY_STEP 10
 #define POSE_PICK_RADIUS 12.0f
 #define LIGHT_COUNT 3
 #define OPPOSITE_LIGHT_ANGLE 3.14159265f
@@ -115,9 +117,15 @@ static PoseExportOptions exportOptions = {
 static bool showDepth = false;
 static int exportPreview = 0;
 static int poseRevision = 0;
-static PoseExportResult exportResult = { 0 };
-static PoseExportOptions exportBuilt = { 0 };
-static int exportBuiltRevision = -1;
+
+typedef struct {
+    PoseExportResult result;
+    PoseExportOptions built;
+    int revision;
+} ExportCache;
+
+static ExportCache exportCache = { .revision = -1 };
+static ExportCache compareCache = { .revision = -1 };
 
 typedef enum {
     VIEW_ONION,
@@ -126,7 +134,27 @@ typedef enum {
     VIEW_COUNT
 } ViewMode;
 
-static ViewMode viewMode = VIEW_ONION;
+typedef enum {
+    LAYER_RAW,
+    LAYER_SMOOTH,
+    LAYER_COUNT
+} CompareLayer;
+
+typedef struct {
+    const char *name;
+    Color tint;
+    bool on;
+    int opacity;
+} CompareStyle;
+
+static CompareStyle compareLayers[LAYER_COUNT] = {
+    [LAYER_RAW] = { "Raw", { 255, 120, 90, 255 }, true, COMPARE_OPACITY_DEFAULT },
+    [LAYER_SMOOTH] = { "Smoothed", { 90, 200, 255, 255 }, true, COMPARE_OPACITY_DEFAULT }
+};
+static RenderTexture2D layerTarget = { 0 };
+static bool compareOn = false;
+
+static ViewMode viewMode = VIEW_BOTH;
 static int onionOpacity = ONION_OPACITY_DEFAULT;
 static bool inspectorOn = false;
 static int impactFrame = -1;
@@ -432,7 +460,7 @@ static void StepFrame(int direction)
 
 static bool ExportMarks(void)
 {
-    return poseMode && exportPreview && exportResult.count == frameCount;
+    return poseMode && exportPreview && exportCache.result.count == frameCount;
 }
 
 static int TimelineStep(void)
@@ -494,7 +522,7 @@ static void DrawTimeline(void)
 
         if (ExportMarks())
             color = !filled ? (Color){ 28, 32, 42, 255 }
-                : (exportResult.keep[frame] ? (Color){ 70, 160, 120, 255 } : (Color){ 42, 48, 62, 255 });
+                : (exportCache.result.keep[frame] ? (Color){ 70, 160, 120, 255 } : (Color){ 42, 48, 62, 255 });
 
         if (!exportPreview && filled && frame == impactFrame)
             color = SKYBLUE;
@@ -528,7 +556,8 @@ static void UnloadSprite(void)
     free(depthMaps);
     free(poses);
     free(frameFlips);
-    PoseExportFree(&exportResult);
+    PoseExportFree(&exportCache.result);
+    PoseExportFree(&compareCache.result);
     for (int i = 0; i < 2 * ONION_MAX; i++)
     {
         if (onionTextures[i].id != 0)
@@ -1318,6 +1347,8 @@ static const char *ViewModeName(void)
     return names[viewMode];
 }
 
+enum { LAYER_TOGGLE, LAYER_DOWN, LAYER_VALUE, LAYER_UP, LAYER_CONTROLS };
+
 typedef enum {
     CTRL_INSPECTOR,
     CTRL_IMPACT,
@@ -1326,32 +1357,52 @@ typedef enum {
     CTRL_MODE,
     CTRL_ONION_DOWN, CTRL_ONION_VALUE, CTRL_ONION_UP,
     CTRL_OPACITY_DOWN, CTRL_OPACITY_VALUE, CTRL_OPACITY_UP,
-    CTRL_COUNT
+    CTRL_COMPARE,
+    CTRL_PLAY,
+    CTRL_LAYER_FIRST,
+    CTRL_COUNT = CTRL_LAYER_FIRST + LAYER_CONTROLS * LAYER_COUNT
 } BottomControl;
 
-static const float BottomControlWidth[CTRL_COUNT] = {
-    100.0f, 96.0f,
-    22.0f, 80.0f, 22.0f,
-    22.0f, 80.0f, 22.0f,
-    130.0f,
-    22.0f, 84.0f, 22.0f,
-    22.0f, 104.0f, 22.0f
-};
+static float BottomControlWidth(int control)
+{
+    static const float row[CTRL_COMPARE] = {
+        100.0f, 96.0f,
+        22.0f, 80.0f, 22.0f,
+        22.0f, 80.0f, 22.0f,
+        130.0f,
+        22.0f, 84.0f, 22.0f,
+        22.0f, 104.0f, 22.0f
+    };
+    static const float layer[LAYER_CONTROLS] = { 110.0f, 22.0f, 84.0f, 22.0f };
 
-static void LayoutBottomControls(Rectangle rects[CTRL_COUNT])
+    if (control < CTRL_COMPARE)
+        return row[control];
+
+    if (control == CTRL_COMPARE)
+        return 150.0f;
+
+    return control == CTRL_PLAY ? 90.0f : layer[(control - CTRL_LAYER_FIRST) % LAYER_CONTROLS];
+}
+
+static void LayoutControlRow(Rectangle rects[CTRL_COUNT], int first, int end, float y)
 {
     float right = (float)GetScreenWidth() - Ui(BOTTOM_ROW_RIGHT);
 
-    for (int i = CTRL_COUNT - 1; i >= 0; i--)
+    for (int i = end - 1; i >= first; i--)
     {
-        float width = Ui(BottomControlWidth[i]);
+        float width = Ui(BottomControlWidth(i));
 
-        rects[i] = (Rectangle){
-            right - width, (float)GetScreenHeight() - Ui(BOTTOM_ROW_HEIGHT),
-            width, Ui(BOTTOM_ROW_HEIGHT)
-        };
+        rects[i] = (Rectangle){ right - width, y, width, Ui(BOTTOM_ROW_HEIGHT) };
         right = rects[i].x - Ui(BOTTOM_SPACING);
     }
+}
+
+static void LayoutBottomControls(Rectangle rects[CTRL_COUNT])
+{
+    float bottom = (float)GetScreenHeight();
+
+    LayoutControlRow(rects, 0, CTRL_COMPARE, bottom - Ui(BOTTOM_ROW_HEIGHT));
+    LayoutControlRow(rects, CTRL_COMPARE, CTRL_COUNT, bottom - Ui(COMPARE_ROW_OFFSET));
 }
 
 static void InspectorToggle(void)
@@ -1407,11 +1458,32 @@ static void UpdateBottomControls(void)
     if (CheckCollisionPointRec(mouse, r[CTRL_ONION_UP]) && onionCount < ONION_MAX)
         onionCount++;
 
-    if (CheckCollisionPointRec(mouse, r[CTRL_OPACITY_DOWN]) && onionOpacity > ONION_OPACITY_MIN)
-        onionOpacity -= ONION_OPACITY_STEP;
+    if (CheckCollisionPointRec(mouse, r[CTRL_OPACITY_DOWN]) && onionOpacity > OPACITY_MIN)
+        onionOpacity -= OPACITY_STEP;
 
-    if (CheckCollisionPointRec(mouse, r[CTRL_OPACITY_UP]) && onionOpacity < ONION_OPACITY_MAX)
-        onionOpacity += ONION_OPACITY_STEP;
+    if (CheckCollisionPointRec(mouse, r[CTRL_OPACITY_UP]) && onionOpacity < OPACITY_MAX)
+        onionOpacity += OPACITY_STEP;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_COMPARE]))
+        compareOn = !compareOn;
+
+    if (CheckCollisionPointRec(mouse, r[CTRL_PLAY]) && frameCount > 1)
+        playing = !playing;
+
+    for (int l = 0; l < LAYER_COUNT; l++)
+    {
+        CompareStyle *layer = &compareLayers[l];
+        const Rectangle *c = &r[CTRL_LAYER_FIRST + LAYER_CONTROLS * l];
+
+        if (CheckCollisionPointRec(mouse, c[LAYER_TOGGLE]))
+            layer->on = !layer->on;
+
+        if (CheckCollisionPointRec(mouse, c[LAYER_DOWN]) && layer->opacity > OPACITY_MIN)
+            layer->opacity -= OPACITY_STEP;
+
+        if (CheckCollisionPointRec(mouse, c[LAYER_UP]) && layer->opacity < OPACITY_MAX)
+            layer->opacity += OPACITY_STEP;
+    }
 }
 
 static void DrawBottomButton(Rectangle rect, const char *text)
@@ -1427,6 +1499,25 @@ static void DrawBottomButton(Rectangle rect, const char *text)
         rect.y + Ui(3.0f),
         TEXT_SMALL, RAYWHITE
     );
+}
+
+static void DrawBottomCheckbox(Rectangle rect, const char *text, bool checked)
+{
+    float side = rect.height - Ui(8.0f);
+    Rectangle box = { rect.x + Ui(6.0f), rect.y + Ui(4.0f), side, side };
+
+    DrawRectangleRec(rect, CheckCollisionPointRec(GetMousePosition(), rect)
+        ? (Color){ 70, 80, 100, 255 }
+        : (Color){ 45, 52, 68, 255 });
+    DrawRectangleLinesEx(box, Ui(1.0f), RAYWHITE);
+
+    if (checked)
+        DrawRectangleRec(
+            (Rectangle){ box.x + Ui(3.0f), box.y + Ui(3.0f), box.width - Ui(6.0f), box.height - Ui(6.0f) },
+            GOLD
+        );
+
+    DrawUiText(text, box.x + box.width + Ui(8.0f), rect.y + Ui(3.0f), TEXT_SMALL, RAYWHITE);
 }
 
 static void DrawBottomValue(Rectangle rect, const char *text)
@@ -1460,6 +1551,19 @@ static void DrawBottomControls(void)
     DrawBottomButton(r[CTRL_OPACITY_DOWN], "-");
     DrawBottomValue(r[CTRL_OPACITY_VALUE], TextFormat("Opacity: %d%%", onionOpacity));
     DrawBottomButton(r[CTRL_OPACITY_UP], "+");
+    DrawBottomCheckbox(r[CTRL_COMPARE], "Raw vs Smoothed", compareOn);
+    DrawBottomButton(r[CTRL_PLAY], playing ? "Play: on" : "Play: off");
+
+    for (int l = 0; l < LAYER_COUNT; l++)
+    {
+        const CompareStyle *layer = &compareLayers[l];
+        const Rectangle *c = &r[CTRL_LAYER_FIRST + LAYER_CONTROLS * l];
+
+        DrawBottomButton(c[LAYER_TOGGLE], TextFormat("%s: %s", layer->name, layer->on ? "on" : "off"));
+        DrawBottomButton(c[LAYER_DOWN], "-");
+        DrawBottomValue(c[LAYER_VALUE], TextFormat("Alpha: %d%%", layer->opacity));
+        DrawBottomButton(c[LAYER_UP], "+");
+    }
 }
 
 static void RedetectPose(int index)
@@ -1631,19 +1735,19 @@ static void DrawSideBillboard(Rectangle side, Rectangle view, float pivot, Recta
     EndScissorMode();
 }
 
-static void RefreshExportPreview(void)
+static void RefreshExportCache(ExportCache *cache, const PoseExportOptions *options)
 {
-    if (exportBuiltRevision == poseRevision && !memcmp(&exportBuilt, &exportOptions, sizeof exportBuilt))
+    if (cache->revision == poseRevision && !memcmp(&cache->built, options, sizeof cache->built))
         return;
 
-    PoseExportBuild(&exportResult, poses, frameCount, sprite.width, sprite.height, &exportOptions);
-    exportBuilt = exportOptions;
-    exportBuiltRevision = poseRevision;
+    PoseExportBuild(&cache->result, poses, frameCount, sprite.width, sprite.height, options);
+    cache->built = *options;
+    cache->revision = poseRevision;
 }
 
 static float ExportScaleX(Rectangle view)
 {
-    return exportBuilt.aspect ? view.height : view.width;
+    return exportCache.built.aspect ? view.height : view.width;
 }
 
 static Vector2 ExportToStage(Rectangle view, const float *p)
@@ -1716,14 +1820,14 @@ static void DrawExportGhost(const Vector2 *joints)
 
 static void DrawExportPreview(Rectangle view, Rectangle side)
 {
-    RefreshExportPreview();
+    RefreshExportCache(&exportCache, &exportOptions);
 
     float floorY = view.y + view.height;
     float centerX = view.x + view.width * 0.5f;
     int sent = 0;
 
     for (int i = 0; i < frameCount; i++)
-        sent += exportResult.count == frameCount && exportResult.keep[i];
+        sent += exportCache.result.count == frameCount && exportCache.result.keep[i];
 
     DrawRectangleRec(view, (Color){ 22, 26, 36, 255 });
     DrawRectangleLinesEx(view, Ui(1.0f), (Color){ 70, 80, 100, 255 });
@@ -1737,20 +1841,20 @@ static void DrawExportPreview(Rectangle view, Rectangle side)
     );
     DrawUiText("gray: detection | color: exported", view.x + Ui(10.0f), view.y + Ui(30.0f), TEXT_SMALL, GRAY);
 
-    int k = PoseExportFind(&exportResult, frameIndex);
+    int k = PoseExportFind(&exportCache.result, frameIndex);
     float shown[POSE_JOINTS][3];
 
-    if (!PoseExportSample(&exportResult, frameIndex, shown))
+    if (!PoseExportSample(&exportCache.result, frameIndex, shown))
     {
         DrawUiText("No pose for this frame", view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, GOLD);
         return;
     }
 
     DrawUiText(
-        exportResult.keep[frameIndex]
+        exportCache.result.keep[frameIndex]
             ? TextFormat("frame_%04d | exported", frameIndex * (exportOptions.emptyFrames + 1))
             : "interpolated between keyframes",
-        view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, exportResult.keep[frameIndex] ? GOLD : SKYBLUE
+        view.x + Ui(10.0f), view.y + Ui(50.0f), TEXT_SMALL, exportCache.result.keep[frameIndex] ? GOLD : SKYBLUE
     );
 
     Vector2 rawFront[POSE_JOINTS], rawLateral[POSE_JOINTS];
@@ -1777,7 +1881,7 @@ static void DrawExportPreview(Rectangle view, Rectangle side)
 
     if (k >= 0)
     {
-        const PoseExportFrame *raw = &exportResult.raw[k];
+        const PoseExportFrame *raw = &exportCache.result.raw[k];
         float rawPivot = (raw->p[POSE_LHIP][0] + raw->p[POSE_RHIP][0]) * 0.5f;
 
         for (int j = 0; j < POSE_JOINTS; j++)
@@ -1878,6 +1982,91 @@ static void DrawOnionFrames(Rectangle view, Rectangle source)
     }
 }
 
+static bool FitLayerTarget(void)
+{
+    int w = GetScreenWidth();
+    int h = GetScreenHeight();
+
+    if (layerTarget.texture.width == w && layerTarget.texture.height == h)
+        return true;
+
+    if (layerTarget.id != 0)
+        UnloadRenderTexture(layerTarget);
+
+    layerTarget = w > 0 && h > 0 ? LoadRenderTexture(w, h) : (RenderTexture2D){ 0 };
+
+    return layerTarget.id != 0;
+}
+
+static void DrawCompareBody(const PoseExportFrame *frame, Rectangle view, const CompareStyle *style)
+{
+    Vector3 k[POSE_JOINTS + 1];
+    Color *albedo = &bodyModel.material.maps[MATERIAL_MAP_ALBEDO].color;
+    Color previous = *albedo;
+    Rectangle full = { 0.0f, 0.0f, (float)layerTarget.texture.width, (float)layerTarget.texture.height };
+
+    for (int j = 0; j < POSE_JOINTS; j++)
+        k[j] = (Vector3){
+            view.x + frame->p[j][0] * view.width,
+            -(view.y + frame->p[j][1] * view.height),
+            (frame->p[j][2] - 0.5f) * view.height
+        };
+
+    FillPelvis3D(k);
+    body_pose(&bodyModel, k);
+    *albedo = style->tint;
+
+    BeginTextureMode(layerTarget);
+    ClearBackground(BLANK);
+    BeginMode3D(BodyCamera());
+    DrawMesh(bodyModel.mesh, bodyModel.material, MatrixIdentity());
+    EndMode3D();
+    EndTextureMode();
+
+    *albedo = previous;
+
+    BeginScissorMode((int)view.x, (int)view.y, (int)view.width, (int)view.height);
+    DrawTexturePro(
+        layerTarget.texture, (Rectangle){ 0.0f, 0.0f, full.width, -full.height },
+        full, (Vector2){ 0.0f, 0.0f }, 0.0f,
+        (Color){ 255, 255, 255, (unsigned char)(255 * style->opacity / 100) }
+    );
+    EndScissorMode();
+}
+
+static void DrawCompareLayers(Rectangle view)
+{
+    if (!compareOn)
+        return;
+
+    PoseExportOptions options = { .smooth = exportOptions.smooth };
+
+    RefreshExportCache(&compareCache, &options);
+
+    int k = PoseExportFind(&compareCache.result, frameIndex);
+
+    if (k < 0 || !bodyModelReady || !FitLayerTarget())
+        return;
+
+    const PoseExportFrame *frames[LAYER_COUNT] = {
+        [LAYER_RAW] = &compareCache.result.raw[k],
+        [LAYER_SMOOTH] = &compareCache.result.frames[k]
+    };
+    float legendX = view.x + Ui(10.0f);
+
+    for (int l = 0; l < LAYER_COUNT; l++)
+    {
+        const CompareStyle *layer = &compareLayers[l];
+
+        if (!layer->on)
+            continue;
+
+        DrawCompareBody(frames[l], view, layer);
+        DrawUiText(layer->name, legendX, view.y + Ui(8.0f), TEXT_BODY, layer->tint);
+        legendX += MeasureUiText(layer->name, TEXT_BODY) + Ui(14.0f);
+    }
+}
+
 static void DrawPoseView(void)
 {
     Rectangle view = PoseViewRect();
@@ -1899,6 +2088,7 @@ static void DrawPoseView(void)
             showDepth ? (Rectangle){ 0.0f, 0.0f, (float)depthTexture.width, (float)depthTexture.height } : source,
             view, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE
         );
+        DrawCompareLayers(view);
     }
 
     Rectangle side = SidePanelRect();
@@ -2337,6 +2527,9 @@ int main(int argc, char **argv)
 
     if (UiFontIsCustom())
         UnloadFont(uiFont);
+
+    if (layerTarget.id != 0)
+        UnloadRenderTexture(layerTarget);
 
     if (bodyModelReady)
         BodyModelClose(&bodyModel);
